@@ -13,6 +13,7 @@ Preparado para:
 - Búsqueda de imágenes
 - Análisis de imágenes (usuario adjunta)
 - Notificaciones push (FCM)
+- Memoria a largo plazo por usuario (Firestore)
 - CORS
 """
 
@@ -73,7 +74,7 @@ ollama_client = Client(
 
 
 # ============================================================
-# FIREBASE ADMIN (para notificaciones)
+# FIREBASE ADMIN (para notificaciones y memoria)
 # ============================================================
 
 firebase_initialized = False
@@ -102,7 +103,7 @@ try:
         print(f"Firebase Admin inicializado con: {_sa_path}")
     else:
         print("ADVERTENCIA: no se encontró firebase-service-account.json. "
-              "Las notificaciones push no funcionarán.")
+              "Las notificaciones push y la memoria persistente no funcionarán.")
 
 except Exception as e:
     print(f"ADVERTENCIA: error inicializando Firebase Admin: {e}")
@@ -360,10 +361,52 @@ def validar_imagen_base64(image_base64: str):
 
 
 # ============================================================
+# MEMORIA DE USUARIO (FIRESTORE)
+# ============================================================
+
+def get_user_memories(uid):
+    """Obtiene la lista de recuerdos del usuario desde Firestore."""
+    if not firebase_initialized or not uid:
+        return []
+    try:
+        from firebase_admin import firestore
+        db = firestore.client()
+        doc = db.collection("users").document(uid) \
+            .collection("settings").document("memory").get()
+        if doc.exists:
+            return doc.to_dict().get("memories", [])
+    except Exception as e:
+        print(f"[Memory] Error leyendo recuerdos desde Firestore: {e}")
+    return []
+
+
+def save_user_memory(uid, new_memory):
+    """Guarda un nuevo recuerdo en la lista del usuario en Firestore."""
+    if not firebase_initialized or not uid or not new_memory:
+        return
+    try:
+        from firebase_admin import firestore
+        db = firestore.client()
+        doc_ref = db.collection("users").document(uid) \
+            .collection("settings").document("memory")
+        
+        doc = doc_ref.get()
+        current_memories = doc.to_dict().get("memories", []) if doc.exists else []
+        
+        if new_memory not in current_memories:
+            current_memories.append(new_memory)
+            current_memories = current_memories[-20:]  # Límite de 20 recuerdos clave
+            doc_ref.set({"memories": current_memories})
+            print(f"[Memory] Nuevo recuerdo guardado para {uid}: {new_memory}")
+    except Exception as e:
+        print(f"[Memory] Error guardando recuerdo en Firestore: {e}")
+
+
+# ============================================================
 # CONSTRUIR MENSAJES
 # ============================================================
 
-def build_messages(history, custom_instructions=None, user_image_base64=None):
+def build_messages(history, custom_instructions=None, user_image_base64=None, memories=None):
     """Construye la lista de mensajes para Ollama."""
 
     messages = []
@@ -379,6 +422,14 @@ Cuando recibas una imagen:
 - Si algo no es visible, dilo claramente.
 - Si el usuario no dio ninguna instrucción con la imagen,
   descríbela de forma útil.
+"""
+
+    if memories and isinstance(memories, list):
+        memories_text = "\n".join(f"- {m}" for m in memories)
+        system_prompt += f"""
+
+RECUERDOS SOBRE EL USUARIO (Información que conoces de conversaciones pasadas):
+{memories_text}
 """
 
     if custom_instructions:
@@ -641,7 +692,10 @@ def api_chat():
                 history = []
 
         custom_instructions = data.get("custom_instructions", {})
-        uid = data.get("uid")  # ← la app manda el uid para notificar
+        uid = data.get("uid")
+
+        # 👇 Obtener recuerdos del usuario desde Firestore
+        user_memories = get_user_memories(uid) if uid else []
 
         raw_image = data.get("image_base64")
         user_image_base64 = validar_imagen_base64(raw_image) if raw_image else None
@@ -649,7 +703,7 @@ def api_chat():
         if raw_image and not user_image_base64:
             print("[api_chat] Imagen base64 rechazada (inválida o demasiado grande)")
 
-        print(f"[api_chat] history len={len(history)} imagen={'sí' if user_image_base64 else 'no'} uid={uid}")
+        print(f"[api_chat] history len={len(history)} imagen={'sí' if user_image_base64 else 'no'} uid={uid} recuerdos={len(user_memories)}")
 
         if not history:
             return jsonify({
@@ -660,8 +714,10 @@ def api_chat():
         messages = build_messages(
             history,
             custom_instructions,
-            user_image_base64=user_image_base64
+            user_image_base64=user_image_base64,
+            memories=user_memories
         )
+        
         result = run_agent(messages)
 
         text = (result.get("text") or "").strip()
@@ -679,6 +735,12 @@ def api_chat():
                 "response": "",
                 "images": result.get("images", [])
             }), 502
+
+        # 👇 Auto-aprendizaje básico: Guarda si el usuario menciona algo clave
+        if uid and history:
+            last_msg = history[-1].get("content", "").lower()
+            if any(k in last_msg for k in ["me llamo", "mi favorito", "estudio", "trabajo en", "juego"]):
+                save_user_memory(uid, history[-1].get("content"))
 
         # --- Notificación push ---
         if uid:
@@ -713,23 +775,6 @@ def api_chat():
 
 @app.route("/api/send-notification", methods=["POST"])
 def api_send_notification():
-    """
-    Envía una notificación push manual.
-
-    Body esperado:
-    {
-        "uid": "abc123",              # opcional, si querés mandar a un usuario específico
-        "token": "xxxxx",             # opcional, si querés mandar a un token específico
-        "title": "Título",
-        "body": "Mensaje",
-        "data": { ... }               # opcional
-    }
-
-    Si mandás 'uid', busca el token en Firestore.
-    Si mandás 'token' directo, lo usa.
-    Si no mandás ninguno, falla.
-    """
-
     if not firebase_initialized:
         return jsonify({
             "success": False,
