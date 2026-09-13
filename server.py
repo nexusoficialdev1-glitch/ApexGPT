@@ -12,6 +12,7 @@ Preparado para:
 - YouTube (via Supadata API)
 - Búsqueda de imágenes
 - Análisis de imágenes (usuario adjunta)
+- Análisis de archivos (usuario adjunta)  ← NUEVO
 - Notificaciones push (FCM)
 - Memoria a largo plazo por usuario (Firestore)
 - CORS
@@ -74,7 +75,7 @@ ollama_client = Client(
 
 
 # ============================================================
-# FIREBASE ADMIN (para notificaciones y memoria)
+# FIREBASE ADMIN
 # ============================================================
 
 firebase_initialized = False
@@ -83,10 +84,9 @@ try:
     import firebase_admin
     from firebase_admin import credentials, messaging
 
-    # Buscar el archivo del Service Account en varias rutas posibles
     _sa_path_candidates = [
         "firebase-service-account.json",
-        "/etc/secrets/firebase-service-account.json",  # Render Secret Files
+        "/etc/secrets/firebase-service-account.json",
         os.environ.get("FIREBASE_SERVICE_ACCOUNT_PATH", ""),
     ]
 
@@ -144,6 +144,16 @@ BÚSQUEDA DE IMÁGENES:
 
 Si el usuario solicita buscar o mostrar imágenes, usa image_search.
 No escribas URLs de imágenes directamente al usuario.
+
+ARCHIVOS ADJUNTOS:
+
+Si el usuario adjunta un archivo, verás su contenido dentro de un
+bloque ```. Úsalo como contexto. Si el archivo es muy largo, céntrate
+en lo que el usuario pregunta específicamente.
+
+- Si el usuario pregunta "qué dice el archivo", resúmelo.
+- Si el usuario pregunta algo específico, responde solo sobre eso.
+- No inventes información que no esté en el archivo.
 
 PRECISIÓN:
 
@@ -395,7 +405,7 @@ def save_user_memory(uid, new_memory):
         
         if new_memory not in current_memories:
             current_memories.append(new_memory)
-            current_memories = current_memories[-20:]  # Límite de 20 recuerdos clave
+            current_memories = current_memories[-20:]
             doc_ref.set({"memories": current_memories})
             print(f"[Memory] Nuevo recuerdo guardado para {uid}: {new_memory}")
     except Exception as e:
@@ -694,7 +704,6 @@ def api_chat():
         custom_instructions = data.get("custom_instructions", {})
         uid = data.get("uid")
 
-        # 👇 Obtener recuerdos del usuario desde Firestore
         user_memories = get_user_memories(uid) if uid else []
 
         raw_image = data.get("image_base64")
@@ -703,13 +712,34 @@ def api_chat():
         if raw_image and not user_image_base64:
             print("[api_chat] Imagen base64 rechazada (inválida o demasiado grande)")
 
-        print(f"[api_chat] history len={len(history)} imagen={'sí' if user_image_base64 else 'no'} uid={uid} recuerdos={len(user_memories)}")
+        # 👇 NUEVO: leer archivo adjunto
+        file_name = data.get("file_name")
+        file_text = data.get("file_text")
+
+        # Limitar a 100k caracteres para no reventar el contexto
+        if file_text and isinstance(file_text, str):
+            file_text = file_text[:100_000]
+
+        print(f"[api_chat] history len={len(history)} imagen={'sí' if user_image_base64 else 'no'} archivo={file_name or 'no'} uid={uid} recuerdos={len(user_memories)}")
 
         if not history:
             return jsonify({
                 "success": False,
                 "message": "No hay mensajes para procesar"
             }), 400
+
+        # 👇 NUEVO: si hay archivo adjunto, lo inyectamos en el último mensaje del usuario
+        if file_text and file_name and history:
+            last = history[-1]
+            if last.get("role") == "user":
+                original = str(last.get("content", "")).strip()
+                last["content"] = (
+                    f"[El usuario adjuntó un archivo llamado \"{file_name}\"]\n\n"
+                    f"Contenido del archivo:\n"
+                    f"```\n{file_text}\n```\n\n"
+                    f"---\n\n"
+                    f"Mensaje del usuario: {original}"
+                )
 
         messages = build_messages(
             history,
@@ -736,13 +766,13 @@ def api_chat():
                 "images": result.get("images", [])
             }), 502
 
-        # 👇 Auto-aprendizaje básico: Guarda si el usuario menciona algo clave
+        # Auto-aprendizaje básico
         if uid and history:
             last_msg = history[-1].get("content", "").lower()
             if any(k in last_msg for k in ["me llamo", "mi favorito", "estudio", "trabajo en", "juego"]):
                 save_user_memory(uid, history[-1].get("content"))
 
-        # --- Notificación push ---
+        # Notificación push
         if uid:
             token = get_user_fcm_token(uid)
             if token:
