@@ -1,7 +1,7 @@
 """
-NexusAI — server.py
+ApexGPT — server.py
 
-Backend del chatbot de NexusAI.
+Backend del chatbot de ApexGPT.
 
 Preparado para:
 - Render
@@ -12,7 +12,7 @@ Preparado para:
 - YouTube (via Supadata API)
 - Búsqueda de imágenes
 - Análisis de imágenes (usuario adjunta)
-- Análisis de archivos (usuario adjunta)  ← NUEVO
+- Análisis de archivos (usuario adjunta)
 - Notificaciones push (FCM)
 - Memoria a largo plazo por usuario (Firestore)
 - CORS
@@ -127,18 +127,36 @@ SUPADATA_POLL_DELAY_SECONDS = 2
 # SYSTEM PROMPT
 # ============================================================
 
-NEXUSAI_SYSTEM_PROMPT = """
-Eres un asistente de inteligencia artificial creado para ayudar al
-usuario de forma útil, precisa, natural y práctica.
+APEXGPT_SYSTEM_PROMPT = """
+Eres ApexGPT, un asistente de inteligencia artificial con identidad propia,
+creado para ayudar al usuario de forma útil, precisa, natural y práctica.
 
 IDENTIDAD:
 
+- Tu nombre es ApexGPT.
 - Fuiste creado por Josuexs, un desarrollador venezolano.
-- Si el usuario pregunta quién te creó, responde únicamente:
-  "Fui creado por Josuexs, un desarrollador venezolano."
-- No inventes datos sobre el proyecto ni sobre sus creadores.
-- El usuario puede darte un nombre personalizado. Si lo hace,
-  adopta ese nombre como tu identidad y úsalo con naturalidad.
+- Cuando el usuario pregunte quién eres, quién te creó o de dónde vienes,
+  responde de forma natural, cercana y con personalidad. Menciona siempre:
+  tu nombre (ApexGPT), tu creador (Josuexs) y que es venezolano.
+- No respondas con una sola frase seca. Da contexto breve y cálido.
+- Ejemplo de respuesta (varía la redacción con naturalidad):
+  "Soy ApexGPT, un asistente creado por Josuexs, un desarrollador
+  venezolano que quiso construir algo con identidad propia: directo,
+  útil y sin tanto relleno. Estoy aquí para lo que necesites."
+- No inventes datos sobre el proyecto, la empresa, la fecha de creación
+  ni sobre otros creadores.
+- El usuario puede darte un nombre personalizado. Si lo hace, adopta ese
+  nombre como tu identidad y úsalo con naturalidad.
+
+PERSONALIDAD:
+
+- Tienes un tono cercano, directo y sin exageraciones.
+- No usas frases hechas vacías como "¡Claro que sí!" o "¡Por supuesto!".
+- Cuando no sabes algo, lo dices sin rodeos.
+- Puedes tener un humor sutil cuando encaje, pero sin forzarlo.
+- No eres servil ni exageradamente entusiasta.
+- No repites la pregunta del usuario antes de responder.
+- Puedes usar "yo" con naturalidad, como una persona con criterio.
 
 BÚSQUEDA DE IMÁGENES:
 
@@ -170,6 +188,7 @@ CONVERSACIÓN:
 - Sé natural, amigable, directo.
 - Usa Markdown cuando ayude.
 - Evita frases repetitivas.
+- Evita empezar todas las respuestas con la misma muletilla.
 
 INFORMACIÓN ACTUALIZADA:
 
@@ -399,10 +418,10 @@ def save_user_memory(uid, new_memory):
         db = firestore.client()
         doc_ref = db.collection("users").document(uid) \
             .collection("settings").document("memory")
-        
+
         doc = doc_ref.get()
         current_memories = doc.to_dict().get("memories", []) if doc.exists else []
-        
+
         if new_memory not in current_memories:
             current_memories.append(new_memory)
             current_memories = current_memories[-20:]
@@ -421,7 +440,7 @@ def build_messages(history, custom_instructions=None, user_image_base64=None, me
 
     messages = []
 
-    system_prompt = NEXUSAI_SYSTEM_PROMPT + """
+    system_prompt = APEXGPT_SYSTEM_PROMPT + """
 
 También puedes analizar imágenes que el usuario adjunte.
 
@@ -712,11 +731,9 @@ def api_chat():
         if raw_image and not user_image_base64:
             print("[api_chat] Imagen base64 rechazada (inválida o demasiado grande)")
 
-        # 👇 NUEVO: leer archivo adjunto
         file_name = data.get("file_name")
         file_text = data.get("file_text")
 
-        # Limitar a 100k caracteres para no reventar el contexto
         if file_text and isinstance(file_text, str):
             file_text = file_text[:100_000]
 
@@ -728,7 +745,6 @@ def api_chat():
                 "message": "No hay mensajes para procesar"
             }), 400
 
-        # 👇 NUEVO: si hay archivo adjunto, lo inyectamos en el último mensaje del usuario
         if file_text and file_name and history:
             last = history[-1]
             if last.get("role") == "user":
@@ -747,7 +763,7 @@ def api_chat():
             user_image_base64=user_image_base64,
             memories=user_memories
         )
-        
+
         result = run_agent(messages)
 
         text = (result.get("text") or "").strip()
@@ -779,7 +795,7 @@ def api_chat():
                 preview = text[:120] + ("…" if len(text) > 120 else "")
                 send_push_notification(
                     fcm_token=token,
-                    title="ApeX respondió",
+                    title="ApexGPT respondió",
                     body=preview,
                     data={"type": "chat_reply"}
                 )
@@ -816,7 +832,7 @@ def api_send_notification():
 
         uid = data.get("uid")
         token = data.get("token")
-        title = data.get("title", "ApeX")
+        title = data.get("title", "ApexGPT")
         body = data.get("body", "")
         extra_data = data.get("data", {})
 
@@ -856,7 +872,7 @@ def api_send_notification():
 def health():
     return jsonify({
         "status": "ok",
-        "service": "NexusAI Chat API",
+        "service": "ApexGPT Chat API",
         "model": MODEL_NAME,
         "ollama_key_set": bool(OLLAMA_API_KEY),
         "firebase_initialized": firebase_initialized,
