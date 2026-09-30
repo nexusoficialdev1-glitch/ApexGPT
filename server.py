@@ -13,6 +13,7 @@ Preparado para:
 - Búsqueda de imágenes
 - Análisis de imágenes (usuario adjunta)
 - Análisis de archivos (usuario adjunta)
+- Modos: Pensamiento Profundo y Búsqueda Inteligente
 - Notificaciones push (FCM)
 - Memoria a largo plazo por usuario (Firestore)
 - CORS
@@ -512,6 +513,34 @@ RECUERDOS SOBRE EL USUARIO (Información que conoces de conversaciones pasadas):
                     f"o cuando el usuario se refiera a ti."
                 )
 
+            # 👇 MODO PENSAMIENTO PROFUNDO
+            deep_thinking = custom_instructions.get("deep_thinking")
+            if deep_thinking is True:
+                partes.append(
+                    "MODO PENSAMIENTO PROFUNDO ACTIVADO:\n"
+                    "- Piensa paso a paso antes de responder.\n"
+                    "- Considera múltiples ángulos, matices y contraejemplos.\n"
+                    "- Estructura la respuesta con razonamiento explícito cuando sea útil.\n"
+                    "- No sacrifiques profundidad por brevedad.\n"
+                    "- Si hay ambigüedad, explora las interpretaciones posibles.\n"
+                    "- Usa ejemplos concretos y analogías cuando ayuden a entender.\n"
+                    "- Puedes estructurar con subtítulos o listas cuando el tema sea complejo."
+                )
+
+            # 👇 MODO BÚSQUEDA INTELIGENTE
+            smart_search = custom_instructions.get("smart_search")
+            if smart_search is True:
+                partes.append(
+                    "MODO BÚSQUEDA INTELIGENTE ACTIVADO:\n"
+                    "- Antes de responder, usa web_search para buscar información actualizada.\n"
+                    "- Verifica datos, fechas, precios y noticias con la herramienta.\n"
+                    "- Si el usuario pregunta algo factual, busca antes de responder.\n"
+                    "- Cita las fuentes cuando sea relevante.\n"
+                    "- Si el tema no requiere búsqueda (ej: matemáticas simples, definiciones básicas), "
+                    "responde directamente sin buscar.\n"
+                    "- Prioriza fuentes recientes y confiables."
+                )
+
             custom_instructions_text = "\n".join(f"- {p}" for p in partes if p)
 
         else:
@@ -737,7 +766,14 @@ def api_chat():
         if file_text and isinstance(file_text, str):
             file_text = file_text[:100_000]
 
-        print(f"[api_chat] history len={len(history)} imagen={'sí' if user_image_base64 else 'no'} archivo={file_name or 'no'} uid={uid} recuerdos={len(user_memories)}")
+        print(
+            f"[api_chat] history len={len(history)} "
+            f"imagen={'sí' if user_image_base64 else 'no'} "
+            f"archivo={file_name or 'no'} "
+            f"uid={uid} recuerdos={len(user_memories)} "
+            f"deep_thinking={custom_instructions.get('deep_thinking', False)} "
+            f"smart_search={custom_instructions.get('smart_search', False)}"
+        )
 
         if not history:
             return jsonify({
