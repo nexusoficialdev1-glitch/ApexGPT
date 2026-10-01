@@ -608,14 +608,11 @@ RECUERDOS SOBRE EL USUARIO (Información que conoces de conversaciones pasadas):
             smart_search = custom_instructions.get("smart_search")
             if smart_search is True:
                 partes.append(
-                    "MODO BÚSQUEDA INTELIGENTE ACTIVADO:\n"
-                    "- Antes de responder, usa web_search para buscar información actualizada.\n"
-                    "- Verifica datos, fechas, precios y noticias con la herramienta.\n"
-                    "- Si el usuario pregunta algo factual, busca antes de responder.\n"
-                    "- Cita las fuentes cuando sea relevante.\n"
-                    "- Si el tema no requiere búsqueda (ej: matemáticas simples, definiciones básicas), "
-                    "responde directamente sin buscar.\n"
-                    "- Prioriza fuentes recientes y confiables."
+                    "MODO BÚSQUEDA INTELIGENTE ACTIVADO (OBLIGATORIO):\n"
+                    "- SIEMPRE debes usar web_search ANTES de responder. No respondas de memoria.\n"
+                    "- Como mínimo, haz UNA búsqueda para verificar la información.\n"
+                    "- Después de la búsqueda, responde basándote en los resultados.\n"
+                    "- Menciona las fuentes que encontraste."
                 )
 
             custom_instructions_text = "\n".join(f"- {p}" for p in partes if p)
@@ -679,53 +676,69 @@ PREFERENCIAS DEL USUARIO:
 
 def extract_web_sources(raw_result) -> list:
     """
-    Intenta extraer fuentes (title, url, snippet) del resultado crudo
-    que devuelve `web_search` de ollama. Soporta varios formatos:
-    - Lista de dicts
-    - String con URLs
-    - Dict con 'results'
+    Extrae fuentes (title, url, snippet) del resultado de web_search.
+    Soporta:
+    - WebSearchResponse de ollama (con .results)
+    - Listas de dicts
+    - Strings con URLs
+    - Objetos con atributos url/title/content
     """
     sources = []
 
+    def add_source(url, title="", snippet=""):
+        """Helper para agregar una fuente si la URL es válida."""
+        if url and isinstance(url, str) and url.startswith("http"):
+            sources.append({
+                "title": str(title or "Fuente web")[:200],
+                "url": url,
+                "snippet": str(snippet or "")[:300]
+            })
+
     try:
-        # Caso 1: ya es una lista
-        if isinstance(raw_result, list):
+        # CASO 1: WebSearchResponse de ollama (objeto con .results)
+        if hasattr(raw_result, "results"):
+            results = raw_result.results
+            if isinstance(results, list):
+                for item in results:
+                    url = getattr(item, "url", None)
+                    title = getattr(item, "title", None)
+                    content = getattr(item, "content", None)
+                    add_source(url, title, content)
+
+        # CASO 2: es una lista
+        elif isinstance(raw_result, list):
             for item in raw_result:
                 if isinstance(item, dict):
                     url = item.get("url") or item.get("link") or item.get("href")
-                    if url and isinstance(url, str):
-                        sources.append({
-                            "title": str(item.get("title") or item.get("name") or "")[:200],
-                            "url": url,
-                            "snippet": str(item.get("snippet") or item.get("description") or item.get("content") or "")[:300]
-                        })
+                    title = item.get("title") or item.get("name") or ""
+                    snippet = item.get("snippet") or item.get("description") or item.get("content") or ""
+                    add_source(url, title, snippet)
+                elif hasattr(item, "url"):
+                    url = getattr(item, "url", None)
+                    title = getattr(item, "title", None)
+                    content = getattr(item, "content", None)
+                    add_source(url, title, content)
 
-        # Caso 2: es un dict con 'results'
+        # CASO 3: es un dict con 'results'
         elif isinstance(raw_result, dict):
             results = raw_result.get("results") or raw_result.get("items") or []
             if isinstance(results, list):
                 for item in results:
                     if isinstance(item, dict):
                         url = item.get("url") or item.get("link") or item.get("href")
-                        if url and isinstance(url, str):
-                            sources.append({
-                                "title": str(item.get("title") or item.get("name") or "")[:200],
-                                "url": url,
-                                "snippet": str(item.get("snippet") or item.get("description") or item.get("content") or "")[:300]
-                            })
+                        title = item.get("title") or item.get("name") or ""
+                        snippet = item.get("snippet") or item.get("description") or item.get("content") or ""
+                        add_source(url, title, snippet)
 
-        # Caso 3: es un string → extraer URLs con regex
+        # CASO 4: es un string → extraer URLs con regex
         elif isinstance(raw_result, str):
             urls = re.findall(r'https?://[^\s<>"\')\]]+', raw_result)
             for url in urls[:12]:
-                sources.append({
-                    "title": "Fuente web",
-                    "url": url,
-                    "snippet": ""
-                })
+                add_source(url, "Fuente web", "")
 
     except Exception as e:
         print(f"[web_sources] Error extrayendo fuentes: {e}")
+        traceback.print_exc()
 
     # Deduplicar por URL
     seen = set()
@@ -735,6 +748,7 @@ def extract_web_sources(raw_result) -> list:
             seen.add(s["url"])
             unique.append(s)
 
+    print(f"[web_sources] Total extraídas: {len(unique)}")
     return unique[:15]
 
 
@@ -772,13 +786,10 @@ def run_agent(messages):
                     try:
                         result = function_to_call(**args)
 
-                        # Imágenes de image_search
                         if function_name == "image_search" and isinstance(result, list):
                             image_results.extend(result)
 
-                        # NUEVO: capturar fuentes de web_search
                         if function_name == "web_search":
-                            # LOG para debug: ver qué devuelve web_search
                             print(f"[web_search] RAW type: {type(result).__name__}")
                             print(f"[web_search] RAW content (primeros 500 chars): {str(result)[:500]}")
 
@@ -821,7 +832,6 @@ def run_agent(messages):
         if len(unique_images) >= 12:
             break
 
-    # Deduplicar web_sources por URL
     seen_web = set()
     unique_web = []
     for s in web_sources:
@@ -1079,7 +1089,6 @@ def api_chat():
                 "web_sources": result.get("web_sources", [])
             }), 502
 
-        # DETECTAR PETICIÓN DE IMAGEN
         generated_image_url = None
         image_error = None
 
@@ -1096,13 +1105,11 @@ def api_chat():
                 if image_error:
                     text += f"\n\n_(No pude generar la imagen: {image_error})_"
 
-        # Auto-aprendizaje básico
         if uid and history:
             last_msg = history[-1].get("content", "").lower()
             if any(k in last_msg for k in ["me llamo", "mi favorito", "estudio", "trabajo en", "juego"]):
                 save_user_memory(uid, history[-1].get("content"))
 
-        # Notificación push
         if uid:
             token = get_user_fcm_token(uid)
             if token:
