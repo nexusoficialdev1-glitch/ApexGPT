@@ -777,10 +777,14 @@ def run_agent(messages):
                             image_results.extend(result)
 
                         # 👈 NUEVO: capturar fuentes de web_search
-                        if function_name == "web_search":
-                            nuevas_fuentes = extract_web_sources(result)
-                            web_sources.extend(nuevas_fuentes)
-                            print(f"[web_search] '{args.get('query', '')[:40]}' -> {len(nuevas_fuentes)} fuentes")
+if function_name == "web_search":
+    # 🔍 LOG para debug: ver qué devuelve web_search
+    print(f"[web_search] RAW type: {type(result).__name__}")
+    print(f"[web_search] RAW content (primeros 500 chars): {str(result)[:500]}")
+
+    nuevas_fuentes = extract_web_sources(result)
+    web_sources.extend(nuevas_fuentes)
+    print(f"[web_search] '{args.get('query', '')[:40]}' -> {len(nuevas_fuentes)} fuentes")
 
                         result_text = str(result)[:12000]
 
