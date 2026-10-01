@@ -136,7 +136,7 @@ if not HF_API_TOKEN:
 else:
     print("HF_API_TOKEN configurada. Generación de imágenes habilitada.")
 
-HF_MODEL_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+HF_MODEL_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
 
 IMAGE_STYLES = {
     "none": "{prompt}",
