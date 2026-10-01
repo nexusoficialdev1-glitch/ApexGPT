@@ -139,7 +139,7 @@ else:
 # ✅ Modelo configurable por env var (default: SDXL, que funciona en el router gratuito)
 HF_MODEL_NAME = os.environ.get(
     "HF_MODEL",
-    "stabilityai/stable-diffusion-xl-base-1.0"
+    "black-forest-labs/FLUX.1-schnell"
 ).strip()
 
 # ✅ URL del nuevo router de Hugging Face
