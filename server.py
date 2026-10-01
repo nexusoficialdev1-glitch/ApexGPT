@@ -17,13 +17,14 @@ Preparado para:
 - Notificaciones push (FCM)
 - Memoria a largo plazo por usuario (Firestore)
 - CORS
-- Generación de imágenes (Hugging Face — Router de Inferencia)
+- Generación de imágenes (Hugging Face — InferenceClient)
 """
 
 import os
 import re
 import time
 import base64
+import io
 import traceback
 from urllib.parse import quote
 
@@ -32,6 +33,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from ollama import Client, web_search, web_fetch
+from huggingface_hub import InferenceClient
 
 
 # ============================================================
@@ -136,14 +138,11 @@ if not HF_API_TOKEN:
 else:
     print("HF_API_TOKEN configurada. Generación de imágenes habilitada.")
 
-# ✅ Modelo configurable por env var (default: SDXL, que funciona en el router gratuito)
+# ✅ Modelo de imágenes configurable
 HF_MODEL_NAME = os.environ.get(
     "HF_MODEL",
     "black-forest-labs/FLUX.1-schnell"
 ).strip()
-
-# ✅ URL del nuevo router de Hugging Face
-HF_MODEL_URL = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL_NAME}"
 
 print(f"[image-gen] Modelo configurado: {HF_MODEL_NAME}")
 
@@ -762,7 +761,7 @@ IMAGE_REQUEST_REGEX = re.compile(
 def parse_image_request(text: str):
     """
     Detecta si la respuesta del modelo pide generar una imagen.
-    Devuelve (prompt_limpio, estilo, texto_limpio) o (None, None, None) si no hay petición.
+    Devuelve (prompt_limpio, estilo, texto_limpio) o (None, None, None).
     """
     if not text:
         return None, None, None
@@ -774,7 +773,6 @@ def parse_image_request(text: str):
     prompt = match.group(1).strip()
     style = match.group(2).strip().lower()
 
-    # Limpiar la respuesta: quitar el bloque [GENERAR_IMAGEN: ...]
     cleaned_text = IMAGE_REQUEST_REGEX.sub("", text).strip()
 
     if not prompt:
@@ -783,11 +781,25 @@ def parse_image_request(text: str):
     return (prompt, style, cleaned_text)
 
 
+# ✅ CACHE del cliente HF (se reutiliza para todas las peticiones)
+_hf_client = None
+
+
+def get_hf_client():
+    """Crea (o reutiliza) el InferenceClient de Hugging Face."""
+    global _hf_client
+    if _hf_client is None:
+        _hf_client = InferenceClient(
+            provider="auto",   # ← elige automáticamente el mejor proveedor disponible
+            api_key=HF_API_TOKEN,
+        )
+    return _hf_client
+
+
 def generate_image_hf(prompt: str, style: str = "none"):
     """
-    Llama a Hugging Face y devuelve (image_data_url, error_message).
-    Si todo va bien: (data_url, None)
-    Si falla: (None, mensaje_de_error)
+    Genera una imagen con Hugging Face InferenceClient.
+    Devuelve (image_data_url, error_message).
     """
     if not HF_API_TOKEN:
         return None, "Generación de imágenes no configurada en el servidor."
@@ -796,62 +808,19 @@ def generate_image_hf(prompt: str, style: str = "none"):
     final_prompt = template.format(prompt=prompt)[:500]
 
     try:
-        response = requests.post(
-            HF_MODEL_URL,
-            headers={
-                "Authorization": f"Bearer {HF_API_TOKEN}",
-                "Content-Type": "application/json",
-                "Accept": "image/png",
-            },
-            json={"inputs": final_prompt},
-            timeout=120
+        client = get_hf_client()
+
+        # ✅ El SDK elige el proveedor automáticamente y evita el 410 Gone
+        image = client.text_to_image(
+            final_prompt,
+            model=HF_MODEL_NAME,
         )
 
-        # ============ MANEJO DE ERRORES ============
-        if response.status_code == 503:
-            return None, "El modelo se está cargando. Intenta de nuevo en 20 segundos."
+        # Convertir PIL.Image → bytes PNG → base64
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        image_bytes = buffer.getvalue()
 
-        if response.status_code == 401:
-            return None, (
-                "Token de Hugging Face inválido o sin permisos de Inference. "
-                "Verifica que el token tenga 'Make calls to Inference Providers'."
-            )
-
-        if response.status_code == 403:
-            return None, (
-                "Tu token no tiene acceso a este modelo. "
-                "Prueba con otro modelo o verifica tus permisos en Hugging Face."
-            )
-
-        if response.status_code == 404:
-            return None, (
-                f"El modelo '{HF_MODEL_NAME}' no está disponible en el router. "
-                "Prueba con 'stabilityai/stable-diffusion-xl-base-1.0'."
-            )
-
-        if response.status_code == 429:
-            return None, "Límite de peticiones alcanzado. Espera unos minutos."
-
-        if response.status_code != 200:
-            error_detail = ""
-            try:
-                error_json = response.json()
-                error_detail = error_json.get("error", str(error_json))
-            except Exception:
-                error_detail = response.text[:200] if response.text else "sin detalles"
-
-            return None, f"HF devolvió HTTP {response.status_code}: {error_detail}"
-
-        # ============ VERIFICAR CONTENT-TYPE ============
-        content_type = response.headers.get("Content-Type", "")
-        if "image" not in content_type:
-            try:
-                error_json = response.json()
-                return None, f"HF no devolvió imagen: {error_json.get('error', str(error_json))}"
-            except Exception:
-                return None, f"HF devolvió contenido inesperado ({content_type})"
-
-        image_bytes = response.content
         if not image_bytes or len(image_bytes) < 100:
             return None, "Hugging Face devolvió una imagen vacía."
 
@@ -861,13 +830,31 @@ def generate_image_hf(prompt: str, style: str = "none"):
         print(f"[image-gen] '{prompt[:60]}' OK: {len(image_bytes)} bytes, estilo={style}")
         return data_url, None
 
-    except requests.exceptions.Timeout:
-        return None, "El modelo tardó demasiado. Intenta de nuevo."
-
     except Exception as e:
         print(f"[image-gen] Error: {e}")
         traceback.print_exc()
-        return None, f"Error interno generando imagen: {e}"
+
+        error_str = str(e).lower()
+
+        if "401" in error_str or "unauthorized" in error_str or "invalid" in error_str:
+            return None, (
+                "Token de Hugging Face inválido o sin permisos. "
+                "Verifica que tenga 'Make calls to Inference Providers'."
+            )
+
+        if "403" in error_str or "forbidden" in error_str:
+            return None, "Tu token no tiene acceso a este modelo."
+
+        if "429" in error_str or "rate limit" in error_str:
+            return None, "Límite de peticiones alcanzado. Espera unos minutos."
+
+        if "410" in error_str or "deprecated" in error_str:
+            return None, (
+                f"El modelo '{HF_MODEL_NAME}' fue deprecado. "
+                "Cambia la variable HF_MODEL en Render."
+            )
+
+        return None, f"Error generando imagen: {e}"
 
 
 # ============================================================
