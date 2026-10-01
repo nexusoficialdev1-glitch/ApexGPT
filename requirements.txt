@@ -5,3 +5,4 @@ gunicorn
 youtube-transcript-api
 huggingface_hub
 Pillow
+firebase-admin
