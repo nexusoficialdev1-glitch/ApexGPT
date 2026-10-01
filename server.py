@@ -17,7 +17,7 @@ Preparado para:
 - Notificaciones push (FCM)
 - Memoria a largo plazo por usuario (Firestore)
 - CORS
-- Generación de imágenes (Hugging Face — FLUX.1-schnell)
+- Generación de imágenes (Hugging Face — Router de Inferencia)
 """
 
 import os
@@ -129,10 +129,6 @@ SUPADATA_POLL_DELAY_SECONDS = 2
 # CONFIGURACIÓN HUGGING FACE (GENERACIÓN DE IMÁGENES)
 # ============================================================
 
-# ============================================================
-# CONFIGURACIÓN HUGGING FACE (GENERACIÓN DE IMÁGENES)
-# ============================================================
-
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "").strip()
 
 if not HF_API_TOKEN:
@@ -150,6 +146,7 @@ HF_MODEL_NAME = os.environ.get(
 HF_MODEL_URL = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL_NAME}"
 
 print(f"[image-gen] Modelo configurado: {HF_MODEL_NAME}")
+
 
 IMAGE_STYLES = {
     "none": "{prompt}",
@@ -765,14 +762,14 @@ IMAGE_REQUEST_REGEX = re.compile(
 def parse_image_request(text: str):
     """
     Detecta si la respuesta del modelo pide generar una imagen.
-    Devuelve (prompt_limpio, estilo) o (None, None) si no hay petición.
+    Devuelve (prompt_limpio, estilo, texto_limpio) o (None, None, None) si no hay petición.
     """
     if not text:
-        return None, None
+        return None, None, None
 
     match = IMAGE_REQUEST_REGEX.search(text)
     if not match:
-        return None, None
+        return None, None, None
 
     prompt = match.group(1).strip()
     style = match.group(2).strip().lower()
@@ -781,7 +778,7 @@ def parse_image_request(text: str):
     cleaned_text = IMAGE_REQUEST_REGEX.sub("", text).strip()
 
     if not prompt:
-        return None, None
+        return None, None, None
 
     return (prompt, style, cleaned_text)
 
@@ -803,23 +800,56 @@ def generate_image_hf(prompt: str, style: str = "none"):
             HF_MODEL_URL,
             headers={
                 "Authorization": f"Bearer {HF_API_TOKEN}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "Accept": "image/png",
             },
             json={"inputs": final_prompt},
             timeout=120
         )
 
+        # ============ MANEJO DE ERRORES ============
         if response.status_code == 503:
             return None, "El modelo se está cargando. Intenta de nuevo en 20 segundos."
 
         if response.status_code == 401:
-            return None, "Token de Hugging Face inválido o sin permisos."
+            return None, (
+                "Token de Hugging Face inválido o sin permisos de Inference. "
+                "Verifica que el token tenga 'Make calls to Inference Providers'."
+            )
+
+        if response.status_code == 403:
+            return None, (
+                "Tu token no tiene acceso a este modelo. "
+                "Prueba con otro modelo o verifica tus permisos en Hugging Face."
+            )
+
+        if response.status_code == 404:
+            return None, (
+                f"El modelo '{HF_MODEL_NAME}' no está disponible en el router. "
+                "Prueba con 'stabilityai/stable-diffusion-xl-base-1.0'."
+            )
 
         if response.status_code == 429:
             return None, "Límite de peticiones alcanzado. Espera unos minutos."
 
         if response.status_code != 200:
-            return None, f"HF devolvió HTTP {response.status_code}"
+            error_detail = ""
+            try:
+                error_json = response.json()
+                error_detail = error_json.get("error", str(error_json))
+            except Exception:
+                error_detail = response.text[:200] if response.text else "sin detalles"
+
+            return None, f"HF devolvió HTTP {response.status_code}: {error_detail}"
+
+        # ============ VERIFICAR CONTENT-TYPE ============
+        content_type = response.headers.get("Content-Type", "")
+        if "image" not in content_type:
+            try:
+                error_json = response.json()
+                return None, f"HF no devolvió imagen: {error_json.get('error', str(error_json))}"
+            except Exception:
+                return None, f"HF devolvió contenido inesperado ({content_type})"
 
         image_bytes = response.content
         if not image_bytes or len(image_bytes) < 100:
@@ -993,7 +1023,7 @@ def api_chat():
         image_error = None
 
         parsed = parse_image_request(text)
-        if parsed and len(parsed) == 3:
+        if parsed and len(parsed) == 3 and parsed[0] is not None:
             img_prompt, img_style, cleaned_text = parsed
             print(f"[api_chat] Generando imagen: prompt='{img_prompt[:60]}' estilo={img_style}")
             generated_image_url, image_error = generate_image_hf(img_prompt, img_style)
@@ -1141,6 +1171,7 @@ def health():
         "ollama_key_set": bool(OLLAMA_API_KEY),
         "firebase_initialized": firebase_initialized,
         "image_generation": bool(HF_API_TOKEN),
+        "image_model": HF_MODEL_NAME,
     })
 
 
