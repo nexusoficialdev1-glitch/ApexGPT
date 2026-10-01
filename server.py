@@ -7,7 +7,7 @@ Preparado para:
 - Render
 - Ollama Cloud
 - gemma4:31b-cloud
-- Web Search
+- Web Search (con captura de fuentes)
 - Web Fetch
 - YouTube (via Supadata API)
 - Búsqueda de imágenes
@@ -138,7 +138,6 @@ if not HF_API_TOKEN:
 else:
     print("HF_API_TOKEN configurada. Generación de imágenes habilitada.")
 
-# ✅ Modelo de imágenes configurable
 HF_MODEL_NAME = os.environ.get(
     "HF_MODEL",
     "black-forest-labs/FLUX.1-schnell"
@@ -675,12 +674,78 @@ PREFERENCIAS DEL USUARIO:
 
 
 # ============================================================
+# EXTRAER FUENTES DE WEB_SEARCH
+# ============================================================
+
+def extract_web_sources(raw_result) -> list:
+    """
+    Intenta extraer fuentes (title, url, snippet) del resultado crudo
+    que devuelve `web_search` de ollama. Soporta varios formatos:
+    - Lista de dicts
+    - String con URLs
+    - Dict con 'results'
+    """
+    sources = []
+
+    try:
+        # Caso 1: ya es una lista
+        if isinstance(raw_result, list):
+            for item in raw_result:
+                if isinstance(item, dict):
+                    url = item.get("url") or item.get("link") or item.get("href")
+                    if url and isinstance(url, str):
+                        sources.append({
+                            "title": str(item.get("title") or item.get("name") or "")[:200],
+                            "url": url,
+                            "snippet": str(item.get("snippet") or item.get("description") or item.get("content") or "")[:300]
+                        })
+
+        # Caso 2: es un dict con 'results'
+        elif isinstance(raw_result, dict):
+            results = raw_result.get("results") or raw_result.get("items") or []
+            if isinstance(results, list):
+                for item in results:
+                    if isinstance(item, dict):
+                        url = item.get("url") or item.get("link") or item.get("href")
+                        if url and isinstance(url, str):
+                            sources.append({
+                                "title": str(item.get("title") or item.get("name") or "")[:200],
+                                "url": url,
+                                "snippet": str(item.get("snippet") or item.get("description") or item.get("content") or "")[:300]
+                            })
+
+        # Caso 3: es un string → extraer URLs con regex
+        elif isinstance(raw_result, str):
+            urls = re.findall(r'https?://[^\s<>"\')\]]+', raw_result)
+            for url in urls[:12]:
+                sources.append({
+                    "title": "Fuente web",
+                    "url": url,
+                    "snippet": ""
+                })
+
+    except Exception as e:
+        print(f"[web_sources] Error extrayendo fuentes: {e}")
+
+    # Deduplicar por URL
+    seen = set()
+    unique = []
+    for s in sources:
+        if s["url"] not in seen:
+            seen.add(s["url"])
+            unique.append(s)
+
+    return unique[:15]
+
+
+# ============================================================
 # AGENTE
 # ============================================================
 
 def run_agent(messages):
     final_text = ""
     image_results = []
+    web_sources = []   # 👈 NUEVO
 
     tools = [web_search, web_fetch, youtube_fetch, image_search]
 
@@ -707,8 +772,15 @@ def run_agent(messages):
                     try:
                         result = function_to_call(**args)
 
+                        # Imágenes de image_search
                         if function_name == "image_search" and isinstance(result, list):
                             image_results.extend(result)
+
+                        # 👈 NUEVO: capturar fuentes de web_search
+                        if function_name == "web_search":
+                            nuevas_fuentes = extract_web_sources(result)
+                            web_sources.extend(nuevas_fuentes)
+                            print(f"[web_search] '{args.get('query', '')[:40]}' -> {len(nuevas_fuentes)} fuentes")
 
                         result_text = str(result)[:12000]
 
@@ -745,7 +817,19 @@ def run_agent(messages):
         if len(unique_images) >= 12:
             break
 
-    return {"text": final_text, "images": unique_images}
+    # Deduplicar web_sources por URL
+    seen_web = set()
+    unique_web = []
+    for s in web_sources:
+        if s["url"] not in seen_web:
+            seen_web.add(s["url"])
+            unique_web.append(s)
+
+    return {
+        "text": final_text,
+        "images": unique_images,
+        "web_sources": unique_web[:20]   # 👈 NUEVO
+    }
 
 
 # ============================================================
@@ -759,10 +843,6 @@ IMAGE_REQUEST_REGEX = re.compile(
 
 
 def parse_image_request(text: str):
-    """
-    Detecta si la respuesta del modelo pide generar una imagen.
-    Devuelve (prompt_limpio, estilo, texto_limpio) o (None, None, None).
-    """
     if not text:
         return None, None, None
 
@@ -781,26 +861,20 @@ def parse_image_request(text: str):
     return (prompt, style, cleaned_text)
 
 
-# ✅ CACHE del cliente HF (se reutiliza para todas las peticiones)
 _hf_client = None
 
 
 def get_hf_client():
-    """Crea (o reutiliza) el InferenceClient de Hugging Face."""
     global _hf_client
     if _hf_client is None:
         _hf_client = InferenceClient(
-            provider="auto",   # ← elige automáticamente el mejor proveedor disponible
+            provider="auto",
             api_key=HF_API_TOKEN,
         )
     return _hf_client
 
 
 def generate_image_hf(prompt: str, style: str = "none"):
-    """
-    Genera una imagen con Hugging Face InferenceClient.
-    Devuelve (image_data_url, error_message).
-    """
     if not HF_API_TOKEN:
         return None, "Generación de imágenes no configurada en el servidor."
 
@@ -810,13 +884,11 @@ def generate_image_hf(prompt: str, style: str = "none"):
     try:
         client = get_hf_client()
 
-        # ✅ El SDK elige el proveedor automáticamente y evita el 410 Gone
         image = client.text_to_image(
             final_prompt,
             model=HF_MODEL_NAME,
         )
 
-        # Convertir PIL.Image → bytes PNG → base64
         buffer = io.BytesIO()
         image.save(buffer, format="PNG")
         image_bytes = buffer.getvalue()
@@ -862,8 +934,6 @@ def generate_image_hf(prompt: str, style: str = "none"):
 # ============================================================
 
 def send_push_notification(fcm_token, title, body, data=None):
-    """Envía una notificación push a un dispositivo vía FCM."""
-
     if not firebase_initialized:
         print("[FCM] Firebase Admin no está inicializado, no se envía notificación")
         return False
@@ -903,7 +973,6 @@ def send_push_notification(fcm_token, title, body, data=None):
 
 
 def get_user_fcm_token(uid):
-    """Obtiene el token FCM del usuario desde Firestore."""
     if not firebase_initialized:
         return None
     try:
@@ -991,7 +1060,7 @@ def api_chat():
 
         text = (result.get("text") or "").strip()
 
-        print(f"[api_chat] respuesta len={len(text)} imágenes={len(result.get('images', []))}")
+        print(f"[api_chat] respuesta len={len(text)} imágenes={len(result.get('images', []))} fuentes={len(result.get('web_sources', []))}")
 
         if not text:
             return jsonify({
@@ -1002,7 +1071,8 @@ def api_chat():
                     "y que el servicio de Ollama Cloud esté disponible."
                 ),
                 "response": "",
-                "images": result.get("images", [])
+                "images": result.get("images", []),
+                "web_sources": result.get("web_sources", [])
             }), 502
 
         # ✅ DETECTAR PETICIÓN DE IMAGEN
@@ -1043,7 +1113,8 @@ def api_chat():
         response_payload = {
             "success": True,
             "response": text,
-            "images": result.get("images", [])
+            "images": result.get("images", []),
+            "web_sources": result.get("web_sources", [])   # 👈 NUEVO
         }
 
         if generated_image_url:
@@ -1066,10 +1137,6 @@ def api_chat():
 
 @app.route("/api/generate-image", methods=["POST"])
 def api_generate_image():
-    """
-    Endpoint directo para generar imágenes.
-    Body: { "prompt": "...", "style": "realistic" }
-    """
     try:
         data = request.get_json(force=True) or {}
         prompt = (data.get("prompt") or "").strip()
