@@ -745,7 +745,7 @@ def extract_web_sources(raw_result) -> list:
 def run_agent(messages):
     final_text = ""
     image_results = []
-    web_sources = []   # 👈 NUEVO
+    web_sources = []
 
     tools = [web_search, web_fetch, youtube_fetch, image_search]
 
@@ -776,15 +776,15 @@ def run_agent(messages):
                         if function_name == "image_search" and isinstance(result, list):
                             image_results.extend(result)
 
-                        # 👈 NUEVO: capturar fuentes de web_search
-if function_name == "web_search":
-    # 🔍 LOG para debug: ver qué devuelve web_search
-    print(f"[web_search] RAW type: {type(result).__name__}")
-    print(f"[web_search] RAW content (primeros 500 chars): {str(result)[:500]}")
+                        # NUEVO: capturar fuentes de web_search
+                        if function_name == "web_search":
+                            # LOG para debug: ver qué devuelve web_search
+                            print(f"[web_search] RAW type: {type(result).__name__}")
+                            print(f"[web_search] RAW content (primeros 500 chars): {str(result)[:500]}")
 
-    nuevas_fuentes = extract_web_sources(result)
-    web_sources.extend(nuevas_fuentes)
-    print(f"[web_search] '{args.get('query', '')[:40]}' -> {len(nuevas_fuentes)} fuentes")
+                            nuevas_fuentes = extract_web_sources(result)
+                            web_sources.extend(nuevas_fuentes)
+                            print(f"[web_search] '{args.get('query', '')[:40]}' -> {len(nuevas_fuentes)} fuentes")
 
                         result_text = str(result)[:12000]
 
@@ -832,7 +832,7 @@ if function_name == "web_search":
     return {
         "text": final_text,
         "images": unique_images,
-        "web_sources": unique_web[:20]   # 👈 NUEVO
+        "web_sources": unique_web[:20]
     }
 
 
@@ -1079,7 +1079,7 @@ def api_chat():
                 "web_sources": result.get("web_sources", [])
             }), 502
 
-        # ✅ DETECTAR PETICIÓN DE IMAGEN
+        # DETECTAR PETICIÓN DE IMAGEN
         generated_image_url = None
         image_error = None
 
@@ -1118,7 +1118,7 @@ def api_chat():
             "success": True,
             "response": text,
             "images": result.get("images", []),
-            "web_sources": result.get("web_sources", [])   # 👈 NUEVO
+            "web_sources": result.get("web_sources", [])
         }
 
         if generated_image_url:
