@@ -14,8 +14,8 @@ Preparado para:
 - Análisis de imágenes (usuario adjunta)
 - Análisis de archivos (usuario adjunta)
 - Modos: Pensamiento Profundo y Búsqueda Inteligente
-- Notificaciones push (FCM)
-- Memoria a largo plazo por usuario (Firestore)
+- Memoria contextual (SQLite)
+- Notificaciones push (FCM — opcional)
 - CORS
 - Generación de imágenes (Hugging Face — InferenceClient)
 """
@@ -23,10 +23,14 @@ Preparado para:
 import os
 import re
 import time
+import uuid
+import json
+import sqlite3
 import base64
 import io
 import traceback
 from urllib.parse import quote
+from datetime import datetime, timezone
 
 import requests
 from flask import Flask, request, jsonify
@@ -76,41 +80,6 @@ ollama_client = Client(
     host="https://ollama.com",
     headers={"Authorization": f"Bearer {OLLAMA_API_KEY}"}
 )
-
-
-# ============================================================
-# FIREBASE ADMIN
-# ============================================================
-
-firebase_initialized = False
-
-try:
-    import firebase_admin
-    from firebase_admin import credentials, messaging
-
-    _sa_path_candidates = [
-        "firebase-service-account.json",
-        "/etc/secrets/firebase-service-account.json",
-        os.environ.get("FIREBASE_SERVICE_ACCOUNT_PATH", ""),
-    ]
-
-    _sa_path = None
-    for _p in _sa_path_candidates:
-        if _p and os.path.isfile(_p):
-            _sa_path = _p
-            break
-
-    if _sa_path:
-        cred = credentials.Certificate(_sa_path)
-        firebase_admin.initialize_app(cred)
-        firebase_initialized = True
-        print(f"Firebase Admin inicializado con: {_sa_path}")
-    else:
-        print("ADVERTENCIA: no se encontró firebase-service-account.json. "
-              "Las notificaciones push y la memoria persistente no funcionarán.")
-
-except Exception as e:
-    print(f"ADVERTENCIA: error inicializando Firebase Admin: {e}")
 
 
 # ============================================================
@@ -173,6 +142,207 @@ IMAGE_STYLES = {
         "vibrant flat colors, playful style"
     ),
 }
+
+
+# ============================================================
+# MEMORIA CONTEXTUAL (SQLite)
+# ============================================================
+
+MEMORY_DB_PATH = os.environ.get("MEMORY_DB_PATH", "apexgpt_memory.db")
+
+def init_memory_db():
+    """Inicializa la base de datos SQLite para memoria."""
+    try:
+        conn = sqlite3.connect(MEMORY_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY,
+                uid TEXT NOT NULL,
+                text TEXT NOT NULL,
+                category TEXT DEFAULT 'otro',
+                created_at INTEGER NOT NULL,
+                source TEXT DEFAULT 'auto'
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_uid ON memories(uid)
+        """)
+        conn.commit()
+        conn.close()
+        print(f"[Memory] SQLite inicializado: {MEMORY_DB_PATH}")
+    except Exception as e:
+        print(f"[Memory] Error inicializando SQLite: {e}")
+
+
+# Inicializar al arrancar
+init_memory_db()
+
+
+def get_user_memories(uid, limit=50):
+    """Obtiene la lista de recuerdos del usuario desde SQLite."""
+    if not uid:
+        return []
+    try:
+        conn = sqlite3.connect(MEMORY_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, text, category, created_at, source FROM memories "
+            "WHERE uid = ? ORDER BY created_at DESC LIMIT ?",
+            (uid, limit)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [
+            {
+                "id": r[0],
+                "text": r[1],
+                "category": r[2],
+                "created_at": r[3],
+                "source": r[4],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        print(f"[Memory] Error leyendo memorias: {e}")
+        return []
+
+
+def save_user_memory(uid, memory_obj):
+    """Guarda un recuerdo en SQLite."""
+    if not uid or not memory_obj:
+        return
+    try:
+        text = (memory_obj.get("text") or "").strip()
+        if not text:
+            return
+
+        conn = sqlite3.connect(MEMORY_DB_PATH)
+        cursor = conn.cursor()
+
+        # Evitar duplicados por texto (case-insensitive)
+        cursor.execute(
+            "SELECT id FROM memories WHERE uid = ? AND LOWER(text) = LOWER(?)",
+            (uid, text)
+        )
+        if cursor.fetchone():
+            conn.close()
+            return
+
+        memory_id = memory_obj.get("id") or str(uuid.uuid4())
+        category = memory_obj.get("category", "otro")
+        created_at = memory_obj.get("created_at") or int(time.time())
+        source = memory_obj.get("source", "auto")
+
+        cursor.execute(
+            "INSERT INTO memories (id, uid, text, category, created_at, source) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (memory_id, uid, text[:500], category, created_at, source)
+        )
+        conn.commit()
+        conn.close()
+        print(f"[Memory] Guardado: {text[:80]}...")
+    except Exception as e:
+        print(f"[Memory] Error guardando memoria: {e}")
+
+
+def delete_user_memory(uid, memory_id):
+    """Borra un recuerdo específico."""
+    try:
+        conn = sqlite3.connect(MEMORY_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM memories WHERE uid = ? AND id = ?",
+            (uid, memory_id)
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[Memory] Error borrando memoria: {e}")
+        return False
+
+
+def delete_all_user_memories(uid):
+    """Borra toda la memoria del usuario."""
+    try:
+        conn = sqlite3.connect(MEMORY_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM memories WHERE uid = ?", (uid,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[Memory] Error borrando toda la memoria: {e}")
+        return False
+
+
+def extract_memories_from_conversation(user_message, assistant_response):
+    """
+    Pide al modelo que extraiga hechos duraderos sobre el usuario.
+    Devuelve una lista de {text, category}.
+    """
+    if not user_message or not user_message.strip():
+        return []
+
+    try:
+        prompt = f"""Analiza este intercambio y extrae SOLO hechos duraderos sobre el usuario.
+NO extraigas información temporal ni cosas triviales.
+
+REGLAS:
+- Solo hechos que sigan siendo ciertos en el futuro (nombre, profesión, gustos, ubicación, familia, metas).
+- NO extraigas saludos, preguntas temporales, ni cosas que cambian cada día.
+- Cada hecho debe ser una frase corta y clara, en tercera persona.
+- Máximo 3 hechos por conversación.
+- Clasifica cada hecho con una categoría: identidad, preferencias, trabajo, hobby, otro.
+
+FORMATO de respuesta (JSON estricto, sin texto extra):
+[{{"text": "El usuario se llama Josuexs", "category": "identidad"}}]
+
+Si no hay hechos duraderos, responde con: []
+
+CONVERSACIÓN:
+Usuario: {user_message[:500]}
+Asistente: {assistant_response[:500]}
+
+JSON:"""
+
+        response = ollama_client.chat(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            options={"num_ctx": 2000}
+        )
+
+        content = (response.message.content or "").strip()
+
+        # Limpiar posibles ```json ... ```
+        content = re.sub(r"^```(?:json)?\s*", "", content)
+        content = re.sub(r"\s*```$", "", content)
+
+        try:
+            hechos = json.loads(content)
+        except json.JSONDecodeError:
+            print(f"[Memory] JSON inválido: {content[:200]}")
+            return []
+
+        if not isinstance(hechos, list):
+            return []
+
+        resultado = []
+        for h in hechos[:3]:
+            if isinstance(h, dict) and h.get("text"):
+                resultado.append({
+                    "id": str(uuid.uuid4()),
+                    "text": str(h["text"]).strip()[:300],
+                    "category": h.get("category", "otro"),
+                    "created_at": int(time.time()),
+                    "source": "auto"
+                })
+        return resultado
+
+    except Exception as e:
+        print(f"[Memory] Error extrayendo: {e}")
+        return []
 
 
 # ============================================================
@@ -470,48 +640,6 @@ def validar_imagen_base64(image_base64: str):
 
 
 # ============================================================
-# MEMORIA DE USUARIO (FIRESTORE)
-# ============================================================
-
-def get_user_memories(uid):
-    """Obtiene la lista de recuerdos del usuario desde Firestore."""
-    if not firebase_initialized or not uid:
-        return []
-    try:
-        from firebase_admin import firestore
-        db = firestore.client()
-        doc = db.collection("users").document(uid) \
-            .collection("settings").document("memory").get()
-        if doc.exists:
-            return doc.to_dict().get("memories", [])
-    except Exception as e:
-        print(f"[Memory] Error leyendo recuerdos desde Firestore: {e}")
-    return []
-
-
-def save_user_memory(uid, new_memory):
-    """Guarda un nuevo recuerdo en la lista del usuario en Firestore."""
-    if not firebase_initialized or not uid or not new_memory:
-        return
-    try:
-        from firebase_admin import firestore
-        db = firestore.client()
-        doc_ref = db.collection("users").document(uid) \
-            .collection("settings").document("memory")
-
-        doc = doc_ref.get()
-        current_memories = doc.to_dict().get("memories", []) if doc.exists else []
-
-        if new_memory not in current_memories:
-            current_memories.append(new_memory)
-            current_memories = current_memories[-20:]
-            doc_ref.set({"memories": current_memories})
-            print(f"[Memory] Nuevo recuerdo guardado para {uid}: {new_memory}")
-    except Exception as e:
-        print(f"[Memory] Error guardando recuerdo en Firestore: {e}")
-
-
-# ============================================================
 # CONSTRUIR MENSAJES
 # ============================================================
 
@@ -534,11 +662,25 @@ Cuando recibas una imagen:
 """
 
     if memories and isinstance(memories, list):
-        memories_text = "\n".join(f"- {m}" for m in memories)
-        system_prompt += f"""
+        lines = []
+        for m in memories:
+            if isinstance(m, dict):
+                cat = m.get("category", "otro")
+                txt = m.get("text", "")
+                if txt:
+                    lines.append(f"- [{cat}] {txt}")
+            elif isinstance(m, str):
+                lines.append(f"- {m}")
+
+        if lines:
+            memories_text = "\n".join(lines)
+            system_prompt += f"""
 
 RECUERDOS SOBRE EL USUARIO (Información que conoces de conversaciones pasadas):
 {memories_text}
+
+Usa estos recuerdos para personalizar tus respuestas. NO los menciones
+explícitamente ni digas "recuerdo que...". Simplemente intégralos con naturalidad.
 """
 
     if custom_instructions:
@@ -675,18 +817,10 @@ PREFERENCIAS DEL USUARIO:
 # ============================================================
 
 def extract_web_sources(raw_result) -> list:
-    """
-    Extrae fuentes (title, url, snippet) del resultado de web_search.
-    Soporta:
-    - WebSearchResponse de ollama (con .results)
-    - Listas de dicts
-    - Strings con URLs
-    - Objetos con atributos url/title/content
-    """
+    """Extrae fuentes (title, url, snippet) del resultado de web_search."""
     sources = []
 
     def add_source(url, title="", snippet=""):
-        """Helper para agregar una fuente si la URL es válida."""
         if url and isinstance(url, str) and url.startswith("http"):
             sources.append({
                 "title": str(title or "Fuente web")[:200],
@@ -695,42 +829,42 @@ def extract_web_sources(raw_result) -> list:
             })
 
     try:
-        # CASO 1: WebSearchResponse de ollama (objeto con .results)
         if hasattr(raw_result, "results"):
             results = raw_result.results
             if isinstance(results, list):
                 for item in results:
-                    url = getattr(item, "url", None)
-                    title = getattr(item, "title", None)
-                    content = getattr(item, "content", None)
-                    add_source(url, title, content)
+                    add_source(
+                        getattr(item, "url", None),
+                        getattr(item, "title", None),
+                        getattr(item, "content", None)
+                    )
 
-        # CASO 2: es una lista
         elif isinstance(raw_result, list):
             for item in raw_result:
                 if isinstance(item, dict):
-                    url = item.get("url") or item.get("link") or item.get("href")
-                    title = item.get("title") or item.get("name") or ""
-                    snippet = item.get("snippet") or item.get("description") or item.get("content") or ""
-                    add_source(url, title, snippet)
+                    add_source(
+                        item.get("url") or item.get("link") or item.get("href"),
+                        item.get("title") or item.get("name") or "",
+                        item.get("snippet") or item.get("description") or item.get("content") or ""
+                    )
                 elif hasattr(item, "url"):
-                    url = getattr(item, "url", None)
-                    title = getattr(item, "title", None)
-                    content = getattr(item, "content", None)
-                    add_source(url, title, content)
+                    add_source(
+                        getattr(item, "url", None),
+                        getattr(item, "title", None),
+                        getattr(item, "content", None)
+                    )
 
-        # CASO 3: es un dict con 'results'
         elif isinstance(raw_result, dict):
             results = raw_result.get("results") or raw_result.get("items") or []
             if isinstance(results, list):
                 for item in results:
                     if isinstance(item, dict):
-                        url = item.get("url") or item.get("link") or item.get("href")
-                        title = item.get("title") or item.get("name") or ""
-                        snippet = item.get("snippet") or item.get("description") or item.get("content") or ""
-                        add_source(url, title, snippet)
+                        add_source(
+                            item.get("url") or item.get("link") or item.get("href"),
+                            item.get("title") or item.get("name") or "",
+                            item.get("snippet") or item.get("description") or item.get("content") or ""
+                        )
 
-        # CASO 4: es un string → extraer URLs con regex
         elif isinstance(raw_result, str):
             urls = re.findall(r'https?://[^\s<>"\')\]]+', raw_result)
             for url in urls[:12]:
@@ -740,7 +874,6 @@ def extract_web_sources(raw_result) -> list:
         print(f"[web_sources] Error extrayendo fuentes: {e}")
         traceback.print_exc()
 
-    # Deduplicar por URL
     seen = set()
     unique = []
     for s in sources:
@@ -791,8 +924,6 @@ def run_agent(messages):
 
                         if function_name == "web_search":
                             print(f"[web_search] RAW type: {type(result).__name__}")
-                            print(f"[web_search] RAW content (primeros 500 chars): {str(result)[:500]}")
-
                             nuevas_fuentes = extract_web_sources(result)
                             web_sources.extend(nuevas_fuentes)
                             print(f"[web_search] '{args.get('query', '')[:40]}' -> {len(nuevas_fuentes)} fuentes")
@@ -944,64 +1075,6 @@ def generate_image_hf(prompt: str, style: str = "none"):
 
 
 # ============================================================
-# NOTIFICACIONES PUSH (FCM)
-# ============================================================
-
-def send_push_notification(fcm_token, title, body, data=None):
-    if not firebase_initialized:
-        print("[FCM] Firebase Admin no está inicializado, no se envía notificación")
-        return False
-
-    if not fcm_token:
-        print("[FCM] Token vacío, no se envía notificación")
-        return False
-
-    try:
-        message = messaging.Message(
-            notification=messaging.Notification(
-                title=title,
-                body=body
-            ),
-            data=data or {},
-            token=fcm_token,
-            android=messaging.AndroidConfig(
-                priority="high",
-                notification=messaging.AndroidNotification(
-                    channel_id="apex_messages",
-                    sound="default"
-                )
-            )
-        )
-
-        response = messaging.send(message)
-        print(f"[FCM] Notificación enviada: {response}")
-        return True
-
-    except messaging.UnregisteredError:
-        print("[FCM] Token inválido o expirado")
-        return False
-
-    except Exception as e:
-        print(f"[FCM] Error enviando notificación: {e}")
-        return False
-
-
-def get_user_fcm_token(uid):
-    if not firebase_initialized:
-        return None
-    try:
-        from firebase_admin import firestore
-        db = firestore.client()
-        doc = db.collection("users").document(uid) \
-            .collection("settings").document("app").get()
-        if doc.exists:
-            return doc.to_dict().get("fcmToken")
-    except Exception as e:
-        print(f"[FCM] Error leyendo token desde Firestore: {e}")
-    return None
-
-
-# ============================================================
 # API CHAT
 # ============================================================
 
@@ -1022,6 +1095,7 @@ def api_chat():
         custom_instructions = data.get("custom_instructions", {})
         uid = data.get("uid")
 
+        # ✅ NUEVO: cargar memoria del usuario desde SQLite
         user_memories = get_user_memories(uid) if uid else []
 
         raw_image = data.get("image_base64")
@@ -1089,6 +1163,7 @@ def api_chat():
                 "web_sources": result.get("web_sources", [])
             }), 502
 
+        # DETECTAR PETICIÓN DE IMAGEN
         generated_image_url = None
         image_error = None
 
@@ -1105,27 +1180,32 @@ def api_chat():
                 if image_error:
                     text += f"\n\n_(No pude generar la imagen: {image_error})_"
 
+        # ✅ NUEVO: Auto-aprendizaje inteligente con el modelo
+        memories_saved = []
         if uid and history:
-            last_msg = history[-1].get("content", "").lower()
-            if any(k in last_msg for k in ["me llamo", "mi favorito", "estudio", "trabajo en", "juego"]):
-                save_user_memory(uid, history[-1].get("content"))
+            try:
+                last_user = ""
+                for m in reversed(history):
+                    if m.get("role") == "user":
+                        last_user = m.get("content", "")
+                        break
 
-        if uid:
-            token = get_user_fcm_token(uid)
-            if token:
-                preview = text[:120] + ("…" if len(text) > 120 else "")
-                send_push_notification(
-                    fcm_token=token,
-                    title="ApexGPT respondió",
-                    body=preview,
-                    data={"type": "chat_reply"}
-                )
+                if last_user and text:
+                    nuevos = extract_memories_from_conversation(last_user, text)
+                    for mem in nuevos:
+                        save_user_memory(uid, mem)
+                        memories_saved.append(mem.get("text"))
+                    if nuevos:
+                        print(f"[Memory] {len(nuevos)} recuerdos nuevos para {uid}")
+            except Exception as e:
+                print(f"[Memory] Error en auto-aprendizaje: {e}")
 
         response_payload = {
             "success": True,
             "response": text,
             "images": result.get("images", []),
-            "web_sources": result.get("web_sources", [])
+            "web_sources": result.get("web_sources", []),
+            "memories_saved": memories_saved  # 👈 NUEVO
         }
 
         if generated_image_url:
@@ -1140,6 +1220,56 @@ def api_chat():
             "success": False,
             "message": f"Error interno: {error}"
         }), 500
+
+
+# ============================================================
+# API — MEMORIA (GET / POST / DELETE)
+# ============================================================
+
+@app.route("/api/memory/<uid>", methods=["GET"])
+def api_get_memory(uid):
+    """Devuelve todos los recuerdos del usuario."""
+    memories = get_user_memories(uid)
+    return jsonify({"success": True, "memories": memories})
+
+
+@app.route("/api/memory/<uid>", methods=["POST"])
+def api_add_memory(uid):
+    """Añade un recuerdo manualmente."""
+    try:
+        data = request.get_json(force=True) or {}
+        text = (data.get("text") or "").strip()
+        category = data.get("category", "otro")
+
+        if not text:
+            return jsonify({"success": False, "message": "Falta el texto"}), 400
+
+        memory_obj = {
+            "id": str(uuid.uuid4()),
+            "text": text[:300],
+            "category": category,
+            "created_at": int(time.time()),
+            "source": "manual"
+        }
+        save_user_memory(uid, memory_obj)
+
+        return jsonify({"success": True, "memory": memory_obj})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+@app.route("/api/memory/<uid>/<memory_id>", methods=["DELETE"])
+def api_delete_memory(uid, memory_id):
+    """Borra un recuerdo específico."""
+    ok = delete_user_memory(uid, memory_id)
+    return jsonify({"success": ok})
+
+
+@app.route("/api/memory/<uid>/all", methods=["DELETE"])
+def api_delete_all_memory(uid):
+    """Borra toda la memoria del usuario."""
+    ok = delete_all_user_memories(uid)
+    return jsonify({"success": ok})
 
 
 # ============================================================
@@ -1175,55 +1305,6 @@ def api_generate_image():
 
 
 # ============================================================
-# API — ENVIAR NOTIFICACIÓN MANUAL
-# ============================================================
-
-@app.route("/api/send-notification", methods=["POST"])
-def api_send_notification():
-    if not firebase_initialized:
-        return jsonify({
-            "success": False,
-            "message": "Firebase Admin no está inicializado en el servidor."
-        }), 500
-
-    try:
-        data = request.get_json(force=True) or {}
-
-        uid = data.get("uid")
-        token = data.get("token")
-        title = data.get("title", "ApexGPT")
-        body = data.get("body", "")
-        extra_data = data.get("data", {})
-
-        if not token and uid:
-            token = get_user_fcm_token(uid)
-
-        if not token:
-            return jsonify({
-                "success": False,
-                "message": "No se encontró un token FCM para enviar la notificación."
-            }), 400
-
-        if not body:
-            return jsonify({
-                "success": False,
-                "message": "Falta el campo 'body'."
-            }), 400
-
-        ok = send_push_notification(token, title, body, extra_data)
-
-        if ok:
-            return jsonify({"success": True, "message": "Notificación enviada."})
-        else:
-            return jsonify({"success": False, "message": "Error enviando notificación."}), 500
-
-    except Exception as error:
-        print("Error en /api/send-notification:", repr(error))
-        traceback.print_exc()
-        return jsonify({"success": False, "message": str(error)}), 500
-
-
-# ============================================================
 # HEALTH CHECK
 # ============================================================
 
@@ -1234,9 +1315,9 @@ def health():
         "service": "ApexGPT Chat API",
         "model": MODEL_NAME,
         "ollama_key_set": bool(OLLAMA_API_KEY),
-        "firebase_initialized": firebase_initialized,
         "image_generation": bool(HF_API_TOKEN),
         "image_model": HF_MODEL_NAME,
+        "memory_db": MEMORY_DB_PATH,
     })
 
 
