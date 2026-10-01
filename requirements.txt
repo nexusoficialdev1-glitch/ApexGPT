@@ -3,3 +3,4 @@ flask-cors
 ollama
 gunicorn
 youtube-transcript-api
+huggingface_hub
