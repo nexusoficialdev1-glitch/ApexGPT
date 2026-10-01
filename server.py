@@ -14,7 +14,7 @@ Preparado para:
 - Análisis de imágenes (usuario adjunta)
 - Análisis de archivos (usuario adjunta)
 - Modos: Pensamiento Profundo y Búsqueda Inteligente
-- Memoria contextual (SQLite)
+- Memoria contextual (Cloudflare D1)
 - Notificaciones push (FCM — opcional)
 - CORS
 - Generación de imágenes (Hugging Face — InferenceClient)
@@ -25,7 +25,6 @@ import re
 import time
 import uuid
 import json
-import sqlite3
 import base64
 import io
 import traceback
@@ -83,96 +82,92 @@ ollama_client = Client(
 
 
 # ============================================================
-# CONFIGURACIÓN SUPADATA
+# CONFIGURACIÓN CLOUDFLARE D1
 # ============================================================
 
-SUPADATA_API_KEY = os.environ.get("SUPADATA_API_KEY", "").strip()
+D1_API_URL = os.environ.get("D1_API_URL", "").strip().rstrip("/")
+D1_API_SECRET = os.environ.get("D1_API_SECRET", "").strip()
 
-if not SUPADATA_API_KEY:
-    print("ADVERTENCIA: SUPADATA_API_KEY no configurada. youtube_fetch no funcionará.")
-
-SUPADATA_TRANSCRIPT_URL = "https://api.supadata.ai/v1/transcript"
-SUPADATA_POLL_MAX_ATTEMPTS = 10
-SUPADATA_POLL_DELAY_SECONDS = 2
-
-
-# ============================================================
-# CONFIGURACIÓN HUGGING FACE (GENERACIÓN DE IMÁGENES)
-# ============================================================
-
-HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "").strip()
-
-if not HF_API_TOKEN:
-    print("ADVERTENCIA: HF_API_TOKEN no configurada. Generación de imágenes deshabilitada.")
+if not D1_API_URL or not D1_API_SECRET:
+    print("ADVERTENCIA: D1_API_URL o D1_API_SECRET no configuradas. "
+          "La memoria persistente NO funcionará.")
 else:
-    print("HF_API_TOKEN configurada. Generación de imágenes habilitada.")
-
-HF_MODEL_NAME = os.environ.get(
-    "HF_MODEL",
-    "black-forest-labs/FLUX.1-schnell"
-).strip()
-
-print(f"[image-gen] Modelo configurado: {HF_MODEL_NAME}")
+    print(f"D1 configurado: {D1_API_URL}")
 
 
-IMAGE_STYLES = {
-    "none": "{prompt}",
-    "realistic": (
-        "A hyper-realistic, high-detail photograph of {prompt}, "
-        "8k resolution, cinematic lighting, sharp focus, professional photography"
-    ),
-    "anime": (
-        "Anime style artwork of {prompt}, vibrant colors, "
-        "studio quality, detailed illustration, cel-shaded"
-    ),
-    "digital": (
-        "Digital art of {prompt}, concept art, highly detailed, "
-        "vibrant colors, trending on ArtStation"
-    ),
-    "minimalist": (
-        "Minimalist illustration of {prompt}, clean lines, "
-        "simple background, flat design, modern aesthetic"
-    ),
-    "3d": (
-        "3D render of {prompt}, Octane render, soft lighting, "
-        "high detail, Pixar style, cinematic"
-    ),
-    "cartoon": (
-        "Cartoon illustration of {prompt}, bold outlines, "
-        "vibrant flat colors, playful style"
-    ),
-}
+def _d1_headers():
+    return {
+        "Authorization": f"Bearer {D1_API_SECRET}",
+        "Content-Type": "application/json",
+    }
 
 
-# ============================================================
-# MEMORIA CONTEXTUAL (SQLite)
-# ============================================================
+def _d1_query_all(query: str, params=None):
+    """Ejecuta un SELECT en D1. Devuelve lista de dicts."""
+    if not D1_API_URL or not D1_API_SECRET:
+        print("[D1] No configurado, devolviendo []")
+        return []
+    try:
+        response = requests.post(
+            f"{D1_API_URL}/query/all",
+            headers=_d1_headers(),
+            json={"queryText": query, "params": params or []},
+            timeout=10,
+        )
+        if not response.ok:
+            print(f"[D1] Error {response.status_code}: {response.text[:200]}")
+            return []
+        data = response.json()
+        # El Worker devuelve el resultado de stmt.all() de D1, que tiene .results
+        if isinstance(data, dict):
+            return data.get("results", []) or []
+        return []
+    except Exception as e:
+        print(f"[D1] Error de conexión (all): {e}")
+        return []
 
-MEMORY_DB_PATH = os.environ.get("MEMORY_DB_PATH", "apexgpt_memory.db")
+
+def _d1_query_run(query: str, params=None) -> bool:
+    """Ejecuta un INSERT/UPDATE/DELETE en D1. Devuelve True si fue bien."""
+    if not D1_API_URL or not D1_API_SECRET:
+        print("[D1] No configurado, no se ejecuta la query")
+        return False
+    try:
+        response = requests.post(
+            f"{D1_API_URL}/query/run",
+            headers=_d1_headers(),
+            json={"queryText": query, "params": params or []},
+            timeout=10,
+        )
+        if not response.ok:
+            print(f"[D1] Error {response.status_code}: {response.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[D1] Error de conexión (run): {e}")
+        return False
+
 
 def init_memory_db():
-    """Inicializa la base de datos SQLite para memoria."""
-    try:
-        conn = sqlite3.connect(MEMORY_DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS memories (
-                id TEXT PRIMARY KEY,
-                uid TEXT NOT NULL,
-                text TEXT NOT NULL,
-                category TEXT DEFAULT 'otro',
-                created_at INTEGER NOT NULL,
-                source TEXT DEFAULT 'auto'
-            )
-        """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_uid ON memories(uid)
-        """)
-        conn.commit()
-        conn.close()
-        print(f"[Memory] SQLite inicializado: {MEMORY_DB_PATH}")
-    except Exception as e:
-        print(f"[Memory] Error inicializando SQLite: {e}")
+    """Crea la tabla e índice si no existen en D1."""
+    if not D1_API_URL or not D1_API_SECRET:
+        print("[D1] init_memory_db: sin configuración, se omite.")
+        return
+
+    ok1 = _d1_query_run("""
+        CREATE TABLE IF NOT EXISTS memories (
+            id TEXT PRIMARY KEY,
+            uid TEXT NOT NULL,
+            text TEXT NOT NULL,
+            category TEXT DEFAULT 'otro',
+            created_at INTEGER NOT NULL,
+            source TEXT DEFAULT 'auto'
+        )
+    """)
+    ok2 = _d1_query_run("""
+        CREATE INDEX IF NOT EXISTS idx_uid ON memories(uid)
+    """)
+    print(f"[D1] Tabla memories verificada (create={ok1}, index={ok2})")
 
 
 # Inicializar al arrancar
@@ -180,26 +175,22 @@ init_memory_db()
 
 
 def get_user_memories(uid, limit=50):
-    """Obtiene la lista de recuerdos del usuario desde SQLite."""
+    """Obtiene la lista de recuerdos del usuario desde D1."""
     if not uid:
         return []
     try:
-        conn = sqlite3.connect(MEMORY_DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
+        rows = _d1_query_all(
             "SELECT id, text, category, created_at, source FROM memories "
             "WHERE uid = ? ORDER BY created_at DESC LIMIT ?",
-            (uid, limit)
+            [uid, limit],
         )
-        rows = cursor.fetchall()
-        conn.close()
         return [
             {
-                "id": r[0],
-                "text": r[1],
-                "category": r[2],
-                "created_at": r[3],
-                "source": r[4],
+                "id": r.get("id"),
+                "text": r.get("text"),
+                "category": r.get("category"),
+                "created_at": r.get("created_at"),
+                "source": r.get("source"),
             }
             for r in rows
         ]
@@ -209,7 +200,7 @@ def get_user_memories(uid, limit=50):
 
 
 def save_user_memory(uid, memory_obj):
-    """Guarda un recuerdo en SQLite."""
+    """Guarda un recuerdo en D1."""
     if not uid or not memory_obj:
         return
     try:
@@ -217,16 +208,12 @@ def save_user_memory(uid, memory_obj):
         if not text:
             return
 
-        conn = sqlite3.connect(MEMORY_DB_PATH)
-        cursor = conn.cursor()
-
         # Evitar duplicados por texto (case-insensitive)
-        cursor.execute(
+        existing = _d1_query_all(
             "SELECT id FROM memories WHERE uid = ? AND LOWER(text) = LOWER(?)",
-            (uid, text)
+            [uid, text],
         )
-        if cursor.fetchone():
-            conn.close()
+        if existing:
             return
 
         memory_id = memory_obj.get("id") or str(uuid.uuid4())
@@ -234,13 +221,11 @@ def save_user_memory(uid, memory_obj):
         created_at = memory_obj.get("created_at") or int(time.time())
         source = memory_obj.get("source", "auto")
 
-        cursor.execute(
+        _d1_query_run(
             "INSERT INTO memories (id, uid, text, category, created_at, source) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (memory_id, uid, text[:500], category, created_at, source)
+            [memory_id, uid, text[:500], category, created_at, source],
         )
-        conn.commit()
-        conn.close()
         print(f"[Memory] Guardado: {text[:80]}...")
     except Exception as e:
         print(f"[Memory] Error guardando memoria: {e}")
@@ -248,33 +233,18 @@ def save_user_memory(uid, memory_obj):
 
 def delete_user_memory(uid, memory_id):
     """Borra un recuerdo específico."""
-    try:
-        conn = sqlite3.connect(MEMORY_DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            "DELETE FROM memories WHERE uid = ? AND id = ?",
-            (uid, memory_id)
-        )
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        print(f"[Memory] Error borrando memoria: {e}")
-        return False
+    return _d1_query_run(
+        "DELETE FROM memories WHERE uid = ? AND id = ?",
+        [uid, memory_id],
+    )
 
 
 def delete_all_user_memories(uid):
     """Borra toda la memoria del usuario."""
-    try:
-        conn = sqlite3.connect(MEMORY_DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM memories WHERE uid = ?", (uid,))
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        print(f"[Memory] Error borrando toda la memoria: {e}")
-        return False
+    return _d1_query_run(
+        "DELETE FROM memories WHERE uid = ?",
+        [uid],
+    )
 
 
 def extract_memories_from_conversation(user_message, assistant_response):
@@ -315,7 +285,6 @@ JSON:"""
 
         content = (response.message.content or "").strip()
 
-        # Limpiar posibles ```json ... ```
         content = re.sub(r"^```(?:json)?\s*", "", content)
         content = re.sub(r"\s*```$", "", content)
 
@@ -475,6 +444,16 @@ Da la respuesta más útil posible. Si no sabes, dilo.
 # ============================================================
 # YOUTUBE — SUPADATA
 # ============================================================
+
+SUPADATA_API_KEY = os.environ.get("SUPADATA_API_KEY", "").strip()
+
+if not SUPADATA_API_KEY:
+    print("ADVERTENCIA: SUPADATA_API_KEY no configurada. youtube_fetch no funcionará.")
+
+SUPADATA_TRANSCRIPT_URL = "https://api.supadata.ai/v1/transcript"
+SUPADATA_POLL_MAX_ATTEMPTS = 10
+SUPADATA_POLL_DELAY_SECONDS = 2
+
 
 def youtube_fetch(url: str) -> str:
     """Obtiene la transcripción de un video de YouTube vía Supadata."""
@@ -1006,6 +985,50 @@ def parse_image_request(text: str):
     return (prompt, style, cleaned_text)
 
 
+HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "").strip()
+
+if not HF_API_TOKEN:
+    print("ADVERTENCIA: HF_API_TOKEN no configurada. Generación de imágenes deshabilitada.")
+else:
+    print("HF_API_TOKEN configurada. Generación de imágenes habilitada.")
+
+HF_MODEL_NAME = os.environ.get(
+    "HF_MODEL",
+    "black-forest-labs/FLUX.1-schnell"
+).strip()
+
+print(f"[image-gen] Modelo configurado: {HF_MODEL_NAME}")
+
+
+IMAGE_STYLES = {
+    "none": "{prompt}",
+    "realistic": (
+        "A hyper-realistic, high-detail photograph of {prompt}, "
+        "8k resolution, cinematic lighting, sharp focus, professional photography"
+    ),
+    "anime": (
+        "Anime style artwork of {prompt}, vibrant colors, "
+        "studio quality, detailed illustration, cel-shaded"
+    ),
+    "digital": (
+        "Digital art of {prompt}, concept art, highly detailed, "
+        "vibrant colors, trending on ArtStation"
+    ),
+    "minimalist": (
+        "Minimalist illustration of {prompt}, clean lines, "
+        "simple background, flat design, modern aesthetic"
+    ),
+    "3d": (
+        "3D render of {prompt}, Octane render, soft lighting, "
+        "high detail, Pixar style, cinematic"
+    ),
+    "cartoon": (
+        "Cartoon illustration of {prompt}, bold outlines, "
+        "vibrant flat colors, playful style"
+    ),
+}
+
+
 _hf_client = None
 
 
@@ -1095,7 +1118,7 @@ def api_chat():
         custom_instructions = data.get("custom_instructions", {})
         uid = data.get("uid")
 
-        # ✅ NUEVO: cargar memoria del usuario desde SQLite
+        # ✅ Cargar memoria del usuario desde D1
         user_memories = get_user_memories(uid) if uid else []
 
         raw_image = data.get("image_base64")
@@ -1180,7 +1203,7 @@ def api_chat():
                 if image_error:
                     text += f"\n\n_(No pude generar la imagen: {image_error})_"
 
-        # ✅ NUEVO: Auto-aprendizaje inteligente con el modelo
+        # ✅ Auto-aprendizaje con D1
         memories_saved = []
         if uid and history:
             try:
@@ -1205,7 +1228,7 @@ def api_chat():
             "response": text,
             "images": result.get("images", []),
             "web_sources": result.get("web_sources", []),
-            "memories_saved": memories_saved  # 👈 NUEVO
+            "memories_saved": memories_saved
         }
 
         if generated_image_url:
@@ -1317,7 +1340,8 @@ def health():
         "ollama_key_set": bool(OLLAMA_API_KEY),
         "image_generation": bool(HF_API_TOKEN),
         "image_model": HF_MODEL_NAME,
-        "memory_db": MEMORY_DB_PATH,
+        "d1_api_url": D1_API_URL or "(no configurado)",
+        "d1_configured": bool(D1_API_URL and D1_API_SECRET),
     })
 
 
