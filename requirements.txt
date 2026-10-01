@@ -4,3 +4,4 @@ ollama
 gunicorn
 youtube-transcript-api
 huggingface_hub
+Pillow
