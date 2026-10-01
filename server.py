@@ -15,6 +15,7 @@ Preparado para:
 - Análisis de archivos (usuario adjunta)
 - Modos: Pensamiento Profundo y Búsqueda Inteligente
 - Memoria contextual (Cloudflare D1)
+- Generación de títulos de chat (nuevo)
 - Notificaciones push (FCM — opcional)
 - CORS
 - Generación de imágenes (Hugging Face — InferenceClient)
@@ -118,7 +119,6 @@ def _d1_query_all(query: str, params=None):
             print(f"[D1] Error {response.status_code}: {response.text[:200]}")
             return []
         data = response.json()
-        # El Worker devuelve el resultado de stmt.all() de D1, que tiene .results
         if isinstance(data, dict):
             return data.get("results", []) or []
         return []
@@ -170,7 +170,6 @@ def init_memory_db():
     print(f"[D1] Tabla memories verificada (create={ok1}, index={ok2})")
 
 
-# Inicializar al arrancar
 init_memory_db()
 
 
@@ -208,7 +207,6 @@ def save_user_memory(uid, memory_obj):
         if not text:
             return
 
-        # Evitar duplicados por texto (case-insensitive)
         existing = _d1_query_all(
             "SELECT id FROM memories WHERE uid = ? AND LOWER(text) = LOWER(?)",
             [uid, text],
@@ -1098,6 +1096,77 @@ def generate_image_hf(prompt: str, style: str = "none"):
 
 
 # ============================================================
+# GENERACIÓN DE TÍTULOS DE CHAT
+# ============================================================
+
+TITLE_PROMPT_TEMPLATE = """Genera un título corto y descriptivo para una conversación.
+
+Mensaje del usuario: {user_message}
+Respuesta del asistente: {assistant_response}
+
+REGLAS ESTRICTAS:
+- Máximo 6 palabras.
+- En el mismo idioma del usuario.
+- Sin comillas, sin asteriscos, sin puntos finales, sin markdown.
+- Describe el TEMA de la conversación, no saludes ni repitas la pregunta.
+- Si el usuario solo saluda sin tema, usa "Saludo inicial".
+
+EJEMPLOS BUENOS:
+- "Mundial 2026 ganador"
+- "Ayuda con código Kotlin"
+- "Receta de arepas venezolanas"
+- "Explicación de agujeros negros"
+
+EJEMPLOS MALOS (NO hacer):
+- "Hola"
+- "Pregunta del usuario"
+- "Conversación nueva"
+- "El usuario pregunta sobre..."
+
+Responde SOLO con el título. Nada más."""
+
+
+def generate_chat_title(user_message: str, assistant_response: str) -> str:
+    """Genera un título descriptivo usando el modelo."""
+    if not user_message or not user_message.strip():
+        return "Nuevo chat"
+
+    try:
+        prompt = TITLE_PROMPT_TEMPLATE.format(
+            user_message=user_message[:500],
+            assistant_response=(assistant_response or "")[:300]
+        )
+
+        response = ollama_client.chat(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            options={"num_ctx": 1000}
+        )
+
+        title = (response.message.content or "").strip()
+
+        # Limpiar caracteres no deseados
+        title = title.strip('"\'`*#').strip()
+        title = title.split("\n")[0].strip()
+        title = title.rstrip(".。!?¡¿,")
+        title = title[:60]
+
+        if not title or len(title) < 2:
+            # Fallback: primeras palabras del mensaje
+            fallback = user_message.strip().split("\n")[0]
+            title = fallback[:40].strip() or "Nuevo chat"
+
+        print(f"[title-gen] '{title}' <- de: '{user_message[:50]}...'")
+        return title
+
+    except Exception as e:
+        print(f"[title-gen] Error: {e}")
+        # Fallback silencioso
+        fallback = user_message.strip().split("\n")[0]
+        return fallback[:40].strip() or "Nuevo chat"
+
+
+# ============================================================
 # API CHAT
 # ============================================================
 
@@ -1118,7 +1187,6 @@ def api_chat():
         custom_instructions = data.get("custom_instructions", {})
         uid = data.get("uid")
 
-        # ✅ Cargar memoria del usuario desde D1
         user_memories = get_user_memories(uid) if uid else []
 
         raw_image = data.get("image_base64")
@@ -1203,7 +1271,7 @@ def api_chat():
                 if image_error:
                     text += f"\n\n_(No pude generar la imagen: {image_error})_"
 
-        # ✅ Auto-aprendizaje con D1
+        # Auto-aprendizaje con D1
         memories_saved = []
         if uid and history:
             try:
@@ -1242,6 +1310,40 @@ def api_chat():
         return jsonify({
             "success": False,
             "message": f"Error interno: {error}"
+        }), 500
+
+
+# ============================================================
+# API — GENERAR TÍTULO DE CHAT
+# ============================================================
+
+@app.route("/api/generate-title", methods=["POST"])
+def api_generate_title():
+    """Genera un título descriptivo para un chat nuevo."""
+    try:
+        data = request.get_json(force=True) or {}
+        user_message = (data.get("user_message") or "").strip()
+        assistant_response = (data.get("assistant_response") or "").strip()
+
+        if not user_message:
+            return jsonify({
+                "success": False,
+                "message": "Falta 'user_message'"
+            }), 400
+
+        title = generate_chat_title(user_message, assistant_response)
+
+        return jsonify({
+            "success": True,
+            "title": title
+        })
+
+    except Exception as e:
+        print(f"[generate-title] Error: {e}")
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "message": str(e)
         }), 500
 
 
