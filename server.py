@@ -17,6 +17,7 @@ Preparado para:
 - Notificaciones push (FCM)
 - Memoria a largo plazo por usuario (Firestore)
 - CORS
+- Generación de imágenes (Hugging Face — FLUX.1-schnell)
 """
 
 import os
@@ -125,6 +126,48 @@ SUPADATA_POLL_DELAY_SECONDS = 2
 
 
 # ============================================================
+# CONFIGURACIÓN HUGGING FACE (GENERACIÓN DE IMÁGENES)
+# ============================================================
+
+HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "").strip()
+
+if not HF_API_TOKEN:
+    print("ADVERTENCIA: HF_API_TOKEN no configurada. Generación de imágenes deshabilitada.")
+else:
+    print("HF_API_TOKEN configurada. Generación de imágenes habilitada.")
+
+HF_MODEL_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+
+IMAGE_STYLES = {
+    "none": "{prompt}",
+    "realistic": (
+        "A hyper-realistic, high-detail photograph of {prompt}, "
+        "8k resolution, cinematic lighting, sharp focus, professional photography"
+    ),
+    "anime": (
+        "Anime style artwork of {prompt}, vibrant colors, "
+        "studio quality, detailed illustration, cel-shaded"
+    ),
+    "digital": (
+        "Digital art of {prompt}, concept art, highly detailed, "
+        "vibrant colors, trending on ArtStation"
+    ),
+    "minimalist": (
+        "Minimalist illustration of {prompt}, clean lines, "
+        "simple background, flat design, modern aesthetic"
+    ),
+    "3d": (
+        "3D render of {prompt}, Octane render, soft lighting, "
+        "high detail, Pixar style, cinematic"
+    ),
+    "cartoon": (
+        "Cartoon illustration of {prompt}, bold outlines, "
+        "vibrant flat colors, playful style"
+    ),
+}
+
+
+# ============================================================
 # SYSTEM PROMPT
 # ============================================================
 
@@ -163,6 +206,34 @@ BÚSQUEDA DE IMÁGENES:
 
 Si el usuario solicita buscar o mostrar imágenes, usa image_search.
 No escribas URLs de imágenes directamente al usuario.
+
+GENERACIÓN DE IMÁGENES:
+
+Si el usuario te pide CREAR, GENERAR, DIBUJAR o DISEÑAR una imagen,
+NO intentes describirla tú mismo. En su lugar responde EXACTAMENTE
+con este formato especial en la primera línea:
+
+[GENERAR_IMAGEN: prompt descriptivo en inglés|estilo]
+
+Donde:
+- "prompt descriptivo en inglés" es una descripción detallada y en inglés
+  de lo que el usuario quiere (traduce si es necesario).
+- "estilo" puede ser: realistic, anime, digital, minimalist, 3d, cartoon o none.
+
+Ejemplos:
+
+Usuario: "hazme una imagen de un gato astronauta"
+Tú: "[GENERAR_IMAGEN: a cute cat wearing an astronaut suit floating in space among stars|realistic]\n\nPerfecto, generando tu imagen de un gato astronauta. Un momento..."
+
+Usuario: "dibuja un paisaje de montañas al atardecer en estilo anime"
+Tú: "[GENERAR_IMAGEN: a beautiful mountain landscape at sunset, vibrant orange and pink sky|anime]\n\nVoy con tu paisaje en estilo anime..."
+
+REGLAS:
+- El bloque [GENERAR_IMAGEN: ...] SIEMPRE va en la PRIMERA línea, solo.
+- Después del bloque, escribe un mensaje corto y natural para el usuario.
+- El prompt interno SIEMPRE debe estar en INGLÉS.
+- Usa un estilo apropiado según lo que pida el usuario.
+- Si el usuario no especifica estilo, usa "realistic".
 
 ARCHIVOS ADJUNTOS:
 
@@ -513,7 +584,6 @@ RECUERDOS SOBRE EL USUARIO (Información que conoces de conversaciones pasadas):
                     f"o cuando el usuario se refiera a ti."
                 )
 
-            # 👇 MODO PENSAMIENTO PROFUNDO
             deep_thinking = custom_instructions.get("deep_thinking")
             if deep_thinking is True:
                 partes.append(
@@ -527,7 +597,6 @@ RECUERDOS SOBRE EL USUARIO (Información que conoces de conversaciones pasadas):
                     "- Puedes estructurar con subtítulos o listas cuando el tema sea complejo."
                 )
 
-            # 👇 MODO BÚSQUEDA INTELIGENTE
             smart_search = custom_instructions.get("smart_search")
             if smart_search is True:
                 partes.append(
@@ -668,6 +737,94 @@ def run_agent(messages):
             break
 
     return {"text": final_text, "images": unique_images}
+
+
+# ============================================================
+# DETECTAR Y GENERAR IMÁGENES
+# ============================================================
+
+IMAGE_REQUEST_REGEX = re.compile(
+    r"\[GENERAR_IMAGEN:\s*(.+?)\|([\w]+)\s*\]",
+    re.IGNORECASE | re.DOTALL
+)
+
+
+def parse_image_request(text: str):
+    """
+    Detecta si la respuesta del modelo pide generar una imagen.
+    Devuelve (prompt_limpio, estilo) o (None, None) si no hay petición.
+    """
+    if not text:
+        return None, None
+
+    match = IMAGE_REQUEST_REGEX.search(text)
+    if not match:
+        return None, None
+
+    prompt = match.group(1).strip()
+    style = match.group(2).strip().lower()
+
+    # Limpiar la respuesta: quitar el bloque [GENERAR_IMAGEN: ...]
+    cleaned_text = IMAGE_REQUEST_REGEX.sub("", text).strip()
+
+    if not prompt:
+        return None, None
+
+    return (prompt, style, cleaned_text)
+
+
+def generate_image_hf(prompt: str, style: str = "none"):
+    """
+    Llama a Hugging Face y devuelve (image_data_url, error_message).
+    Si todo va bien: (data_url, None)
+    Si falla: (None, mensaje_de_error)
+    """
+    if not HF_API_TOKEN:
+        return None, "Generación de imágenes no configurada en el servidor."
+
+    template = IMAGE_STYLES.get(style, IMAGE_STYLES["none"])
+    final_prompt = template.format(prompt=prompt)[:500]
+
+    try:
+        response = requests.post(
+            HF_MODEL_URL,
+            headers={
+                "Authorization": f"Bearer {HF_API_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json={"inputs": final_prompt},
+            timeout=120
+        )
+
+        if response.status_code == 503:
+            return None, "El modelo se está cargando. Intenta de nuevo en 20 segundos."
+
+        if response.status_code == 401:
+            return None, "Token de Hugging Face inválido o sin permisos."
+
+        if response.status_code == 429:
+            return None, "Límite de peticiones alcanzado. Espera unos minutos."
+
+        if response.status_code != 200:
+            return None, f"HF devolvió HTTP {response.status_code}"
+
+        image_bytes = response.content
+        if not image_bytes or len(image_bytes) < 100:
+            return None, "Hugging Face devolvió una imagen vacía."
+
+        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+        data_url = f"data:image/png;base64,{image_base64}"
+
+        print(f"[image-gen] '{prompt[:60]}' OK: {len(image_bytes)} bytes, estilo={style}")
+        return data_url, None
+
+    except requests.exceptions.Timeout:
+        return None, "El modelo tardó demasiado. Intenta de nuevo."
+
+    except Exception as e:
+        print(f"[image-gen] Error: {e}")
+        traceback.print_exc()
+        return None, f"Error interno generando imagen: {e}"
 
 
 # ============================================================
@@ -818,6 +975,23 @@ def api_chat():
                 "images": result.get("images", [])
             }), 502
 
+        # ✅ DETECTAR PETICIÓN DE IMAGEN
+        generated_image_url = None
+        image_error = None
+
+        parsed = parse_image_request(text)
+        if parsed and len(parsed) == 3:
+            img_prompt, img_style, cleaned_text = parsed
+            print(f"[api_chat] Generando imagen: prompt='{img_prompt[:60]}' estilo={img_style}")
+            generated_image_url, image_error = generate_image_hf(img_prompt, img_style)
+
+            if generated_image_url:
+                text = cleaned_text or "Aquí tienes tu imagen."
+            else:
+                text = cleaned_text or text
+                if image_error:
+                    text += f"\n\n_(No pude generar la imagen: {image_error})_"
+
         # Auto-aprendizaje básico
         if uid and history:
             last_msg = history[-1].get("content", "").lower()
@@ -836,11 +1010,16 @@ def api_chat():
                     data={"type": "chat_reply"}
                 )
 
-        return jsonify({
+        response_payload = {
             "success": True,
             "response": text,
             "images": result.get("images", [])
-        })
+        }
+
+        if generated_image_url:
+            response_payload["generated_image"] = generated_image_url
+
+        return jsonify(response_payload)
 
     except Exception as error:
         print("Error en /api/chat:", repr(error))
@@ -849,6 +1028,42 @@ def api_chat():
             "success": False,
             "message": f"Error interno: {error}"
         }), 500
+
+
+# ============================================================
+# API — GENERAR IMAGEN DIRECTA
+# ============================================================
+
+@app.route("/api/generate-image", methods=["POST"])
+def api_generate_image():
+    """
+    Endpoint directo para generar imágenes.
+    Body: { "prompt": "...", "style": "realistic" }
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        prompt = (data.get("prompt") or "").strip()
+        style = (data.get("style") or "none").strip().lower()
+
+        if not prompt:
+            return jsonify({"success": False, "message": "Falta el campo 'prompt'"}), 400
+
+        data_url, error = generate_image_hf(prompt, style)
+
+        if error:
+            return jsonify({"success": False, "message": error}), 500
+
+        return jsonify({
+            "success": True,
+            "image_base64": data_url,
+            "prompt": prompt,
+            "style": style
+        })
+
+    except Exception as e:
+        print(f"[generate-image] Error: {e}")
+        traceback.print_exc()
+        return jsonify({"success": False, "message": str(e)}), 500
 
 
 # ============================================================
@@ -912,6 +1127,7 @@ def health():
         "model": MODEL_NAME,
         "ollama_key_set": bool(OLLAMA_API_KEY),
         "firebase_initialized": firebase_initialized,
+        "image_generation": bool(HF_API_TOKEN),
     })
 
 
