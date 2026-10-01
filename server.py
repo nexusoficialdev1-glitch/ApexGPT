@@ -129,6 +129,10 @@ SUPADATA_POLL_DELAY_SECONDS = 2
 # CONFIGURACIÓN HUGGING FACE (GENERACIÓN DE IMÁGENES)
 # ============================================================
 
+# ============================================================
+# CONFIGURACIÓN HUGGING FACE (GENERACIÓN DE IMÁGENES)
+# ============================================================
+
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "").strip()
 
 if not HF_API_TOKEN:
@@ -136,7 +140,16 @@ if not HF_API_TOKEN:
 else:
     print("HF_API_TOKEN configurada. Generación de imágenes habilitada.")
 
-HF_MODEL_URL = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
+# ✅ Modelo configurable por env var (default: SDXL, que funciona en el router gratuito)
+HF_MODEL_NAME = os.environ.get(
+    "HF_MODEL",
+    "stabilityai/stable-diffusion-xl-base-1.0"
+).strip()
+
+# ✅ URL del nuevo router de Hugging Face
+HF_MODEL_URL = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL_NAME}"
+
+print(f"[image-gen] Modelo configurado: {HF_MODEL_NAME}")
 
 IMAGE_STYLES = {
     "none": "{prompt}",
