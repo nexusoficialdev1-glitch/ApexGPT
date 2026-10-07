@@ -58,10 +58,55 @@ else:
 
 
 # ============================================================
+# MODO MANTENIMIENTO
+# ============================================================
+
+def is_maintenance_mode() -> bool:
+    """Se lee en cada request, así el cambio en Render aplica sin redeploy."""
+    return os.environ.get("MAINTENANCE_MODE", "false").strip().lower() == "true"
+
+
+def get_maintenance_message() -> str:
+    return os.environ.get(
+        "MAINTENANCE_MESSAGE",
+        "Estamos haciendo mejoras. Vuelve en unos minutos."
+    ).strip()
+
+
+# ============================================================
 # INIT DB
 # ============================================================
 
 init_memory_db()
+
+
+# ============================================================
+# MIDDLEWARE DE MANTENIMIENTO
+# ============================================================
+
+@app.before_request
+def check_maintenance():
+    """
+    Si MAINTENANCE_MODE=true, bloquea /api/chat y devuelve un JSON
+    con código 503 para que la app muestre OutOfServiceScreen.
+    Los endpoints /api/health y /api/status siempre están disponibles
+    para que la app pueda consultar el estado.
+    """
+    path = request.path
+
+    # Estos endpoints siempre funcionan, incluso en mantenimiento
+    if path in ("/api/health", "/api/status"):
+        return None
+
+    # Solo bloqueamos endpoints de la API del chat
+    if path.startswith("/api/") and is_maintenance_mode():
+        return jsonify({
+            "success": False,
+            "maintenance": True,
+            "message": get_maintenance_message()
+        }), 503
+
+    return None
 
 
 # ============================================================
@@ -322,8 +367,10 @@ def api_generate_image():
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({
-        "status": "ok",
+        "status": "maintenance" if is_maintenance_mode() else "ok",
         "service": "ApexGPT Chat API",
+        "maintenance": is_maintenance_mode(),
+        "maintenance_message": get_maintenance_message(),
         "model": MODEL_NAME,
         "ollama_key_set": bool(OLLAMA_API_KEY),
         "image_generation": bool(HF_API_TOKEN),
@@ -331,6 +378,21 @@ def health():
         "d1_api_url": D1_API_URL or "(no configurado)",
         "d1_configured": bool(D1_API_URL and D1_API_SECRET),
     })
+
+
+# ============================================================
+# API — STATUS (para la app)
+# ============================================================
+
+@app.route("/api/status", methods=["GET"])
+def api_status():
+    """Endpoint rápido que la app consulta para saber si hay mantenimiento."""
+    maintenance = is_maintenance_mode()
+    return jsonify({
+        "maintenance": maintenance,
+        "message": get_maintenance_message() if maintenance else "",
+        "status": "maintenance" if maintenance else "ok"
+    }), 200
 
 
 # ============================================================
